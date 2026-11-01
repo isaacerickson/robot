@@ -1,0 +1,5 @@
+venv/
+robot.env
+robot.log
+*.pt
+__pycache__/
