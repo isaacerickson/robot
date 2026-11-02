@@ -1,0 +1,11 @@
+Date: (no upload yet)
+Host: (no upload yet)
+Commit: (no upload yet)
+Uptime: (no upload yet)
+Temp: (no upload yet)
+Video devices:
+(no upload yet)
+robot_brain processes:
+(no upload yet)
+--- robot.log (last 300 lines, filtered) ---
+Placeholder. The Pi replaces this file after GH_LOG_TOKEN is set.
