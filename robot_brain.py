@@ -289,24 +289,70 @@ class MotionDetector:
 
 
 # ======================= Threads =======================
+def open_camera():
+    """Try /dev/video0-9 and return the first capture that yields a frame.
+    If none work, log an error and try again every 5 seconds."""
+    backend = cv2.CAP_V4L2 if hasattr(cv2, "CAP_V4L2") else None
+    while state["running"]:
+        for index in range(10):
+            if backend is None:
+                cap = cv2.VideoCapture(index)
+            else:
+                cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+            cap.set(cv2.CAP_PROP_FPS, 15)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)     # always use the newest frame
+            try:
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+            if ok and frame is not None and getattr(frame, "size", 0):
+                height, width = frame.shape[:2]
+                print(f"[VISION] Camera opened on /dev/video{index} ({width}x{height})")
+                return cap
+            cap.release()
+        print("[VISION] ERROR: no working camera found")
+        time.sleep(5)
+    return None
+
+
 def vision_thread():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    cap.set(cv2.CAP_PROP_FPS, 15)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)     # always use the newest frame
+    cap = open_camera()
+    if cap is None:
+        return
 
     detector = PersonDetector()
     motion   = MotionDetector()
     hits     = deque(maxlen=HIT_WINDOW)
     misses_in_a_row = 0
     frame_no = 0
+    bad_reads = 0
+    last_heartbeat = time.time()
 
     while state["running"]:
+        now = time.time()
+        if now - last_heartbeat >= 10.0:
+            print(f"[VISION] frames={frame_no} person_hits={sum(hits)} detector={detector.kind}")
+            last_heartbeat = now
+
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
+            bad_reads += 1
+            if bad_reads >= 30:
+                print("[VISION] Camera stopped giving frames - reopening")
+                cap.release()
+                cap = open_camera()
+                bad_reads = 0
+                if cap is None:
+                    return
+            else:
+                time.sleep(0.1)
             continue
+        bad_reads = 0
         frame_no += 1
         now = time.time()
 
