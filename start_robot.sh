@@ -2,6 +2,7 @@
 # Launches the robot at login, waits for Wi-Fi, restarts it if it crashes,
 # and checks for updates (at boot and every 5 minutes) when ~/robot is linked
 # to an online repo. Updates are pulled and the robot restarts on its own.
+export PYTHONUNBUFFERED=1
 cd "$HOME/robot"
 [ -f robot.env ] && set -a && . ./robot.env && set +a
 source venv/bin/activate
@@ -20,7 +21,7 @@ update() {
 update && echo "$(date) updated at boot" >> robot.log
 
 while true; do
-  python3 robot_brain.py >> robot.log 2>&1 &
+  python3 -u robot_brain.py >> robot.log 2>&1 &
   PID=$!
   while kill -0 $PID 2>/dev/null; do
     sleep 300
