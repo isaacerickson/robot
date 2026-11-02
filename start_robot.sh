@@ -20,11 +20,14 @@ update() {
 }
 update && echo "$(date) updated at boot" >> robot.log
 
+(sleep 60; bash upload_log.sh) &
+
 while true; do
   python3 -u robot_brain.py >> robot.log 2>&1 &
   PID=$!
   while kill -0 $PID 2>/dev/null; do
     sleep 300
+    bash upload_log.sh &
     if update; then
       echo "$(date) new version found - restarting robot" >> robot.log
       kill $PID; wait $PID 2>/dev/null
