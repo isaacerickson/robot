@@ -18,9 +18,12 @@ What's new in v2
   - "I can't find you" no longer freezes the wheels for 5 seconds.
   - Speech is thread-safe (no overlapping pyttsx3 calls).
 
-Install once:
-  pip install ultralytics openai SpeechRecognition pyttsx3 adafruit-circuitpython-motorkit lgpio
-  (ultralytics is optional but strongly recommended)
+Install once (on the Pi: bash install_on_pi.sh):
+  pip install openai SpeechRecognition pyttsx3 adafruit-circuitpython-motorkit "Adafruit-Blinka-Raspberry-Pi-PWM>=1.0.2" lgpio
+  pip install ultralytics
+  ultralytics is optional. Without it, detection falls back to HOG and Haar.
+  Adafruit-Blinka-Raspberry-Pi-PWM is required to import MotorKit on current
+  Raspberry Pi OS; it is not pulled in by adafruit-circuitpython-motorkit.
 Run:
   export XAI_API_KEY="xai-..."
   python3 robot_brain.py
@@ -211,12 +214,62 @@ def ai_respond(user_text):
 
 
 # ======================= Person detectors =======================
+_HAAR_FILENAME = "haarcascade_frontalface_default.xml"
+# Debian/Raspberry Pi OS python3-opencv does not ship cv2.data. opencv-data
+# installs the cascades under the opencv4 path; older images used opencv/.
+_HAAR_SYSTEM_DIRS = (
+    "/usr/share/opencv4/haarcascades",
+    "/usr/share/opencv/haarcascades",
+    "/usr/local/share/opencv4/haarcascades",
+    "/usr/local/share/opencv/haarcascades",
+)
+
+
+def haar_cascade_candidates():
+    """Places a frontal-face Haar XML might live, most specific first."""
+    paths = [os.path.join(os.path.dirname(os.path.abspath(__file__)), _HAAR_FILENAME)]
+    data = getattr(cv2, "data", None)
+    haar_dir = getattr(data, "haarcascades", None) if data is not None else None
+    if haar_dir:
+        paths.append(os.path.join(str(haar_dir), _HAAR_FILENAME))
+    for directory in _HAAR_SYSTEM_DIRS:
+        paths.append(os.path.join(directory, _HAAR_FILENAME))
+    return paths
+
+
+def load_frontal_face_cascade():
+    """Load the frontal-face cascade, or None when no file works.
+
+    A missing XML must not raise. Callers still have HOG body detection.
+    """
+    seen = set()
+    for path in haar_cascade_candidates():
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            continue
+        try:
+            cascade = cv2.CascadeClassifier(path)
+        except Exception as e:
+            print(f"[VISION] Haar cascade {path} failed ({e})")
+            continue
+        if cascade is None or cascade.empty():
+            print(f"[VISION] Haar cascade {path} did not load")
+            continue
+        print(f"[VISION] Haar cascade: {path}")
+        return cascade
+    print("[VISION] No Haar cascade found; HOG body detection only")
+    return None
+
+
 class PersonDetector:
     """YOLOv8n if available, else HOG body + Haar face. Returns list of
     (x, y, w, h, conf) boxes in the coordinates of the frame passed in."""
 
     def __init__(self):
         self.kind = None
+        self.face = None
         try:
             from ultralytics import YOLO
             self.model = YOLO("yolov8n.pt")   # downloads ~6 MB first run
@@ -225,8 +278,7 @@ class PersonDetector:
             print(f"[VISION] YOLO unavailable ({e}); using HOG + face fallback")
             self.hog = cv2.HOGDescriptor()
             self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            self.face = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            self.face = load_frontal_face_cascade()
             self.kind = "hog"
         print(f"[VISION] Person detector: {self.kind}")
 
@@ -240,14 +292,22 @@ class PersonDetector:
                 out.append((x1, y1, x2 - x1, y2 - y1, float(b.conf[0])))
             return out
 
-        # Fallback: faces catch people up close, HOG catches full bodies far away
+        # Fallback: faces catch people up close, HOG catches full bodies far away.
+        # self.face is None when the Haar XML is missing (Debian opencv has no
+        # cv2.data); HOG still runs.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         out = []
-        faces = self.face.detectMultiScale(gray, scaleFactor=1.1,
-                                           minNeighbors=4 if alert else 6,
-                                           minSize=(40, 40))
-        for (x, y, w, h) in faces:
-            out.append((x, y, w, h, 1.0))
+        if self.face is not None:
+            try:
+                faces = self.face.detectMultiScale(gray, scaleFactor=1.1,
+                                                   minNeighbors=4 if alert else 6,
+                                                   minSize=(40, 40))
+            except Exception as e:
+                print(f"[VISION] Face detection failed ({e}); HOG only from here")
+                self.face = None
+                faces = ()
+            for (x, y, w, h) in faces:
+                out.append((x, y, w, h, 1.0))
         boxes, weights = self.hog.detectMultiScale(
             frame, winStride=(8, 8), padding=(8, 8), scale=1.05,
             hitThreshold=0.0 if alert else 0.3)

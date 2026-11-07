@@ -9,6 +9,10 @@ from https://console.x.ai
 2. Open Terminal on the Pi and type:
        cd ~/robot
        bash install_on_pi.sh
+   That installs the motor-board libraries, including
+   Adafruit-Blinka-Raspberry-Pi-PWM (MotorKit will not import without
+   it), and OpenCV's face-detection files: the opencv-data package plus
+   a local copy of the official OpenCV 4.x Haar cascade.
 3. Answer the questions (Wi-Fi name/password, Grok API key, and the
    update link if you have one - just press Enter to skip).
 4. When it says Done, type:  sudo reboot
