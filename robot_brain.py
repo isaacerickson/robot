@@ -8,8 +8,8 @@ Pi 5 compatible: lgpio, not RPi.GPIO.
   - Chat and speech-to-text are Grok (xAI), via XAI_API_KEY and
     https://api.x.ai/v1. Walk up and talk. The mic stays open, replies
     are spoken, and the chat keeps going across turns. No keyboard.
-  - The eyes and the neck follow the largest thing moving in the camera,
-    and a detected person when one is in frame.
+  - The eyes and the neck look at a face in the camera. With no face,
+    they idle. That look does not drive the wheels.
   - The drive wheels stay off while MOTORS_ENABLED is False. The neck
     can still look. Motors are stopped at startup so nothing lurches.
   - Person detection uses YOLOv8n only if it is already installed.
@@ -261,34 +261,59 @@ def speak_async(text):
     threading.Thread(target=speak, args=(text,), daemon=True).start()
 
 
+def _is_camera_input(name):
+    """True for a webcam's built-in mic, which is a poor match for a jack."""
+    return any(word in name for word in ("camera", "webcam", "uvc"))
+
+
 def _input_score(device):
+    """Rank capture devices. Higher is better.
+
+    A USB audio adapter (the 1/8 inch jack: "USB Audio Device") beats a
+    webcam mic. Both names contain "usb", and the camera name also
+    contains "audio", so those words alone must not decide it. HDMI and
+    monitor sources stay below zero and are not chosen.
+    """
     name = (device.get("name") or "").lower()
+    if any(word in name for word in ("hdmi", "vc4", "monitor")):
+        return -50
+    if _is_camera_input(name):
+        return 10
     score = 0
     if "usb" in name:
-        score += 50
-    if "mic" in name or "microphone" in name:
-        score += 20
-    if "webcam" in name or "camera" in name:
-        score += 15
+        score += 40
+    if any(word in name for word in ("audio", "mic", "microphone", "headset", "earphone")):
+        score += 40
     if "pulse" in name or name.strip() == "default":
         score += 5
-    if "hdmi" in name or "vc4" in name:
-        score -= 40
-    if "monitor" in name:
-        score -= 30
     return score
 
 
-def select_input_device(devices):
-    """Pick a microphone index from PyAudio device dicts, or None for the default.
+def select_input_device(devices, prefer=None):
+    """Pick a microphone index, or None to use the system default.
 
-    Prefers a USB / mic input. HDMI and monitor sources are skipped. A
-    non-positive score means nothing looked like a microphone, so the
-    caller should use the system default.
+    prefer is a PyAudio index ("1") or a piece of the device name
+    ("USB Audio", "hw:3,0"). When prefer is omitted, MIC_DEVICE is used.
+    HDMI and monitor sources are never chosen by the automatic ranking.
     """
     inputs = [d for d in devices if int(d.get("max_input_channels") or 0) > 0]
     if not inputs:
         return None
+    if prefer is None:
+        prefer = os.environ.get("MIC_DEVICE", "")
+    prefer = str(prefer).strip()
+    if prefer:
+        if prefer.isdigit():
+            want = int(prefer)
+            for device in inputs:
+                if int(device.get("index", -1)) == want:
+                    return want
+        needle = prefer.lower()
+        matches = [d for d in inputs if needle in (d.get("name") or "").lower()]
+        if matches:
+            best = max(matches, key=lambda d: (_input_score(d), -int(d.get("index", 0))))
+            return int(best["index"])
+        print("[MIC] MIC_DEVICE={0!r} matched no input; choosing automatically".format(prefer))
     best = max(inputs, key=lambda d: (_input_score(d), -int(d.get("index", 0))))
     if _input_score(best) <= 0:
         return None
@@ -322,9 +347,13 @@ def open_microphone():
     except Exception as e:
         print(f"[MIC] Could not list microphones ({e})")
         devices = []
+    prefer = os.environ.get("MIC_DEVICE", "").strip()
+    if prefer:
+        print("[MIC] MIC_DEVICE={0}".format(prefer))
     for d in devices:
-        print(f"[MIC] device {d['index']}: {d['name']} (inputs={d['max_input_channels']})")
-    index = select_input_device(devices)
+        print("[MIC] device {0}: {1} (inputs={2} score={3})".format(
+            d["index"], d["name"], d["max_input_channels"], _input_score(d)))
+    index = select_input_device(devices, prefer=prefer)
     chosen = None
     for d in devices:
         if index is not None and int(d["index"]) == index:
@@ -334,6 +363,10 @@ def open_microphone():
         mic = sr.Microphone(device_index=index) if index is not None else sr.Microphone()
         with mic as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.4)
+        # Freeze the threshold. The dynamic one drifts down into hiss and
+        # then listen() records several seconds of noise before giving up.
+        recognizer.energy_threshold = max(float(recognizer.energy_threshold), 280.0)
+        recognizer.dynamic_energy_threshold = False
         return mic
     except Exception as e:
         print(f"[MIC] Could not open microphone ({e})")
@@ -360,6 +393,44 @@ def wav_bytes_from_audio(audio):
         print(f"[MIC] WAV encode failed ({e})")
     raw = audio.get_raw_data()
     return pcm_to_wav(raw, audio.sample_rate, audio.sample_width)
+
+
+# Below this, a clip is hiss or a click, not someone talking. Sending it
+# to speech-to-text makes up phrases and the reply comes back late.
+MIN_SPEECH_SECONDS = 0.30
+MIN_SPEECH_RMS = 250.0
+MIN_SPEECH_PEAK = 700
+
+
+def pcm_stats(pcm, sample_width):
+    """Return (rms, peak, sample_count) for little-endian PCM."""
+    if sample_width != 2 or not pcm or len(pcm) < 2:
+        return 0.0, 0, 0
+    count = len(pcm) // 2
+    total = 0
+    peak = 0
+    for i in range(count):
+        value = int.from_bytes(pcm[i * 2:i * 2 + 2], "little", signed=True)
+        magnitude = value if value >= 0 else -value
+        if magnitude > peak:
+            peak = magnitude
+        total += value * value
+    return (total / count) ** 0.5, peak, count
+
+
+def audio_has_speech(pcm, sample_rate, sample_width,
+                     min_seconds=MIN_SPEECH_SECONDS,
+                     min_rms=MIN_SPEECH_RMS,
+                     min_peak=MIN_SPEECH_PEAK):
+    """True only when the clip is long enough and loud enough to be speech."""
+    rms, peak, count = pcm_stats(pcm, sample_width)
+    if count <= 0 or not sample_rate or sample_rate <= 0:
+        return False
+    if (count / float(sample_rate)) < min_seconds:
+        return False
+    if rms < min_rms or peak < min_peak:
+        return False
+    return True
 
 
 def clean_transcript(text):
@@ -442,8 +513,12 @@ def transcribe_with_grok(wav_bytes):
         return None
 
 
-def listen_for_speech(mic, timeout=3, phrase_time_limit=12):
-    """Block until a phrase ends or timeout. None if nobody spoke."""
+def listen_for_speech(mic, timeout=3, phrase_time_limit=8):
+    """Block until a phrase ends or timeout. None if nobody spoke.
+
+    Quiet or very short clips are dropped here, so they are not sent to
+    Grok and cannot come back as invented sentences.
+    """
     state["listening"] = True
     audio = None
     try:
@@ -457,6 +532,13 @@ def listen_for_speech(mic, timeout=3, phrase_time_limit=12):
     if audio is None:
         return None
     try:
+        raw = audio.get_raw_data()
+        if not audio_has_speech(raw, audio.sample_rate, audio.sample_width):
+            rms, _peak, count = pcm_stats(raw, audio.sample_width)
+            rate = audio.sample_rate or 1
+            _log_stt("[MIC] Ignored non-speech audio ({0:.0f} ms, rms {1:.0f})".format(
+                1000.0 * count / float(rate), rms))
+            return None
         wav = wav_bytes_from_audio(audio)
     except Exception as e:
         print(f"[MIC] Could not read audio ({e})")
@@ -552,11 +634,15 @@ def load_frontal_face_cascade():
 
 class PersonDetector:
     """YOLOv8n if available, else HOG body + Haar face. Returns list of
-    (x, y, w, h, conf) boxes in the coordinates of the frame passed in."""
+    (x, y, w, h, conf) boxes in the coordinates of the frame passed in.
+
+    The Haar cascade is always loaded. Eye gaze uses faces from it, even
+    when a body detector is what decides whether to follow someone.
+    """
 
     def __init__(self):
         self.kind = None
-        self.face = None
+        self.face = load_frontal_face_cascade()
         try:
             from ultralytics import YOLO
             self.model = YOLO("yolov8n.pt")   # downloads ~6 MB first run
@@ -565,7 +651,6 @@ class PersonDetector:
             print(f"[VISION] YOLO unavailable ({e}); using HOG + face fallback")
             self.hog = cv2.HOGDescriptor()
             self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            self.face = load_frontal_face_cascade()
             self.kind = "hog"
         print(f"[VISION] Person detector: {self.kind}")
 
@@ -602,10 +687,30 @@ class PersonDetector:
             out.append((x, y, w, h, float(wt)))
         return out
 
+    def detect_faces(self, frame):
+        """Haar faces only, in full-frame pixels. Empty if no cascade.
 
-def box_center_norm(box, frame_w, frame_h):
-    x, y, w, h = box[:4]
-    return ((x + w / 2.0) / float(frame_w), (y + h / 2.0) / float(frame_h))
+        Runs on a half-size image so it can run every frame next to HOG
+        without dragging the Pi down. This is for the eyes, not for driving.
+        """
+        if self.face is None or frame is None:
+            return []
+        try:
+            small = cv2.resize(frame, (320, 240))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            found = self.face.detectMultiScale(
+                gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20))
+        except Exception as e:
+            print(f"[VISION] Face detection failed ({e}); eyes will idle")
+            self.face = None
+            return []
+        height, width = frame.shape[:2]
+        sx = width / 320.0
+        sy = height / 240.0
+        faces = []
+        for (x, y, w, h) in found:
+            faces.append((x * sx, y * sy, w * sx, h * sy))
+        return faces
 
 
 def salient_motion(blobs, min_area=MOTION_MIN_AREA,
@@ -622,14 +727,27 @@ def salient_motion(blobs, min_area=MOTION_MIN_AREA,
     return ((x + w / 2.0) / float(width), (y + h / 2.0) / float(height), float(area))
 
 
-def update_gaze(state, now, person_xy, motion_xy, hold_s=GAZE_HOLD_SECONDS):
-    """Point gaze at a person when one is in frame, otherwise at motion.
+def face_gaze_point(faces, frame_w, frame_h):
+    """Center of the largest face, in 0..1 camera space, or None.
 
-    person_xy and motion_xy are (x, y) in 0..1 camera space, or None.
-    The last target is held briefly so the eyes do not flicker off.
-    Returns the smoothed (x, y) or None when there is nothing to look at.
+    faces are (x, y, w, h) in frame pixels. Motion is not a face.
     """
-    chosen = person_xy if person_xy is not None else motion_xy
+    if not faces or not frame_w or not frame_h:
+        return None
+    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+    if w <= 0 or h <= 0:
+        return None
+    return ((x + w / 2.0) / float(frame_w), (y + h / 2.0) / float(frame_h))
+
+
+def update_gaze(state, now, face_xy, hold_s=GAZE_HOLD_SECONDS):
+    """Look at a face. face_xy is (x, y) in 0..1, or None.
+
+    Does not follow motion. A missed frame holds the last face briefly,
+    then the eyes idle. This does not change the drive state.
+    Returns the smoothed (x, y) or None.
+    """
+    chosen = face_xy
     if chosen is not None:
         px, py = chosen
         ox, oy = state.get("gaze_x"), state.get("gaze_y")
@@ -747,7 +865,7 @@ def vision_thread():
     bad_reads = 0
     last_heartbeat = time.time()
     last_motion_log = 0.0
-    last_person_xy = None
+    last_face_log = 0.0
     servo_at_prev = state["servo_angle"]
     last_tick = time.time()
 
@@ -810,28 +928,26 @@ def vision_thread():
                     state["human_visible"]   = True
                     state["last_human_seen"] = now
                     state["alert_until"]     = now + MOTION_ALERT_SECONDS
-                biggest = max(boxes, key=lambda b: b[2] * b[3])
-                last_person_xy = box_center_norm(biggest, frame.shape[1], frame.shape[0])
             else:
                 misses_in_a_row += 1
                 limit = 12 if alert else 8
                 if misses_in_a_row >= limit:
                     state["human_visible"] = False
-                    last_person_xy = None
 
-        if not state["human_visible"]:
-            last_person_xy = None
-
-        motion_xy = (seen[0], seen[1]) if seen else None
-        if state["human_visible"] and last_person_xy is not None:
-            target = update_gaze(state, now, last_person_xy, None)
-        else:
-            target = update_gaze(state, now, None, motion_xy)
+        # Eyes look at a face every frame. This is not the follow state
+        # machine and it does not command the wheels. Motion blobs (often
+        # the whole background) are not a gaze target.
+        faces = detector.detect_faces(frame)
+        face_xy = face_gaze_point(faces, frame.shape[1], frame.shape[0])
+        if face_xy is not None and state.get("gaze_x") is None and now - last_face_log > 2.0:
+            print("[VISION] Face at ({0:.2f}, {1:.2f})".format(face_xy[0], face_xy[1]))
+            last_face_log = now
+        target = update_gaze(state, now, face_xy)
 
         if target is not None:
             command_servo(servo_step_toward(state["servo_angle"], target[0], dt))
-        elif not state["human_visible"] and now >= state["alert_until"]:
-            # Nothing to look at: drift the neck back toward center.
+        else:
+            # No face: ease the neck back to center. Do not chase motion.
             nudged = state["servo_angle"] + (SERVO_CENTER - state["servo_angle"]) * min(0.5, dt * 0.6)
             command_servo(nudged)
 
@@ -860,8 +976,8 @@ def conversation_thread():
     motion) still plays one short greeting if the chat is empty. Later
     turns keep the same conversation.
     """
-    recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.75
+    recognizer.dynamic_energy_threshold = False
+    recognizer.pause_threshold = 0.7
     recognizer.phrase_threshold = 0.3
     recognizer.non_speaking_duration = 0.4
     mic = None
@@ -881,7 +997,7 @@ def conversation_thread():
                 continue
 
         try:
-            heard = listen_for_speech(mic, timeout=3, phrase_time_limit=12)
+            heard = listen_for_speech(mic, timeout=3, phrase_time_limit=8)
         except Exception as e:
             print(f"[MIC] Listen failed ({e}); reopening microphone")
             mic = None

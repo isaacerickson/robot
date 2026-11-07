@@ -9,7 +9,7 @@ the 800x480 DSI the face reads wider than a plain 16:9 fit.
 
 Reads the shared `state` dict from robot_brain.py:
   speaking       -> mouth moves
-  gaze_x/gaze_y  -> eyes follow motion or a person (0..1 in the camera)
+  gaze_x/gaze_y  -> eyes look at a face in the camera (0..1), else idle
   thinking       -> eyes glance up when nothing else is there to look at
   online         -> small "no internet" note when offline
 If face_assets/ is missing, falls back to the cartoon face.
