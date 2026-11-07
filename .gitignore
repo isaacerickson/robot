@@ -3,3 +3,5 @@ robot.env
 robot.log
 *.pt
 __pycache__/
+haarcascade_frontalface_default.xml
+*.partial

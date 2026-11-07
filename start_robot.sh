@@ -7,9 +7,16 @@ cd "$HOME/robot"
 [ -f robot.env ] && set -a && . ./robot.env && set +a
 source venv/bin/activate
 
-for i in $(seq 1 30); do                       # wait up to 60 s for internet
-  ping -c1 -W2 api.x.ai >/dev/null 2>&1 && break
-  sleep 2
+# Wait until https://api.x.ai answers. Do not ICMP-ping it: that host
+# accepts HTTPS and drops ping, which used to burn this whole loop
+# (about two minutes) on every launch. Any HTTP status counts. The bare
+# URL returns 421, and curl -f would treat that as failure.
+for _ in $(seq 1 12); do                       # about a minute if still offline
+  code=$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" https://api.x.ai 2>/dev/null || true)
+  case "$code" in
+    ""|000) sleep 2 ;;
+    *) break ;;
+  esac
 done
 
 update() {
