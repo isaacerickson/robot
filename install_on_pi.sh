@@ -26,11 +26,16 @@ python3 -m venv --system-site-packages venv
 source venv/bin/activate
 pip install --upgrade pip
 # MotorKit imports adafruit_blinka_raspberry_pi_pwm, which is a separate
-# package (pip: Adafruit-Blinka-Raspberry-Pi-PWM). ultralytics stays optional.
+# package (pip: Adafruit-Blinka-Raspberry-Pi-PWM).
+# SpeechRecognition only captures the microphone (system PyAudio above).
+# Transcription is Grok at https://api.x.ai/v1/stt using XAI_API_KEY.
+# Do not pip-install whisper, torch, or ultralytics here. On a 2 GB Pi 5
+# those have pulled huge CUDA wheels. Person detection uses OpenCV HOG +
+# Haar and does not need YOLO. If ultralytics is already installed, the
+# brain will use it; this script does not install it.
 pip install openai SpeechRecognition pyttsx3 \
     adafruit-circuitpython-motorkit "Adafruit-Blinka-Raspberry-Pi-PWM>=1.0.2"
-pip install ultralytics || echo "ultralytics failed - robot will use the fallback detector"
-python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" 2>/dev/null || true  # pre-download model
+echo "Speech capture: PyAudio. Transcription and chat: xAI Grok (no local model)."
 # This is the module import adafruit_motorkit pulls in on a Pi. Importing
 # MotorKit here would also run Blinka's interactive dependency prompt.
 python3 -c "import adafruit_blinka_raspberry_pi_pwm"
@@ -78,6 +83,22 @@ if [ -n "$REPO" ]; then
   echo "Linked to $REPO - updates will install automatically."
 fi
 printf "venv/\nrobot.env\nrobot.log\n*.pt\n__pycache__/\nhaarcascade_frontalface_default.xml\n*.partial\n" > .git/info/exclude 2>/dev/null || true
+
+echo "== USB speakers (ALSA card Device, not HDMI) =="
+# Same route start_robot.sh applies on every launch. HDMI with nothing
+# plugged in makes aplay exit 524. The Unitek adapter's card name is Device.
+export ALSA_CARD=Device
+cat > "$HOME/.asoundrc" << 'EOF'
+pcm.!default {
+    type plug
+    slave.pcm "hw:Device,0"
+}
+ctl.!default {
+    type hw
+    card Device
+}
+EOF
+echo "Default playback is plughw:Device,0"
 
 echo "== Auto-start at power-on =="
 chmod +x start_robot.sh

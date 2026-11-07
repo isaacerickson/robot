@@ -18,8 +18,17 @@ from https://console.x.ai
 4. When it says Done, type:  sudo reboot
 
 From then on the robot starts by itself every time you flip the power on.
-Press Esc on a keyboard to close the face. Problems? Look at ~/robot/robot.log
+The face fills the small 800x480 screen. If that window is minimized, it
+comes back. Clicking desktop settings does not rebuild it. Esc, q, and
+closing the window do not turn the robot off. Speech uses the USB speakers
+(ALSA card "Device"), not HDMI. Walk up and talk; it answers out loud.
+Problems? Look at ~/robot/robot.log
 Don't run robot_brain.py from Thonny anymore - the installer sets everything up.
+
+The drive wheels stay off until talking, the face, and recognition look
+right. In robot_brain.py, MOTORS_ENABLED is False. Set that to True (or
+export MOTORS_ENABLED=1 before start) when it should drive again. The
+neck can still turn to look. The wheels are stopped on startup.
 
 REMOTE STATUS
 =============
