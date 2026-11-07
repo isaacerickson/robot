@@ -21,7 +21,11 @@ From then on the robot starts by itself every time you flip the power on.
 The face fills the small 800x480 screen. If that window is minimized, it
 comes back. Clicking desktop settings does not rebuild it. Esc, q, and
 closing the window do not turn the robot off. Speech uses the USB speakers
-(ALSA card "Device"), not HDMI. Walk up and talk; it answers out loud.
+(ALSA card "Device"), not HDMI. The listening mic is that same kind of
+USB audio adapter (the 1/8 inch jack), not the camera microphone. Export
+MIC_DEVICE to a piece of its name, or its device number, if the names
+differ. The eyes look at a face and idle when no face is there. Walk up
+and talk; it answers out loud.
 Problems? Look at ~/robot/robot.log
 Don't run robot_brain.py from Thonny anymore - the installer sets everything up.
 

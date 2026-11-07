@@ -9,6 +9,7 @@ import wave
 import io
 
 os.environ.pop("MOTORS_ENABLED", None)
+os.environ.pop("MIC_DEVICE", None)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -295,23 +296,58 @@ class ConversationTests(unittest.TestCase):
             {"index": 1, "name": "pulse", "max_input_channels": 1},
         ]), 3)
 
+    def test_jack_adapter_beats_webcam_mic(self):
+        # Names from the live Pi. The camera used to win because both say
+        # "usb" and the camera got an extra bonus for the word "camera".
+        devices = [
+            {"index": 0, "name": "USB 2.0 Camera: Audio (hw:2,0)", "max_input_channels": 1},
+            {"index": 1, "name": "USB Audio Device: - (hw:3,0)", "max_input_channels": 1},
+        ]
+        self.assertGreater(
+            rb._input_score(devices[1]), rb._input_score(devices[0]))
+        self.assertEqual(rb.select_input_device(devices), 1)
+        self.assertEqual(rb.select_input_device(devices, prefer="hw:2,0"), 0)
+        self.assertEqual(rb.select_input_device(devices, prefer="0"), 0)
+        self.assertEqual(rb.select_input_device(devices, prefer="Device"), 1)
+        self.assertEqual(rb.select_input_device(devices, prefer="Audio"), 1)
+
+    def test_quiet_audio_is_not_sent_as_speech(self):
+        def pcm(values):
+            data = bytearray()
+            for value in values:
+                data += int(value).to_bytes(2, "little", signed=True)
+            return bytes(data)
+
+        self.assertFalse(rb.audio_has_speech(pcm([0] * 16000), 16000, 2))
+        self.assertFalse(rb.audio_has_speech(pcm([80, -80] * 8000), 16000, 2))
+        self.assertFalse(rb.audio_has_speech(pcm([8000] * 200), 16000, 2))
+        tone = [4000 if (i // 20) % 2 == 0 else -4000 for i in range(6400)]
+        self.assertTrue(rb.audio_has_speech(pcm(tone), 16000, 2))
+
 
 class TrackingTests(unittest.TestCase):
     def setUp(self):
         self.state = {"gaze_x": None, "gaze_y": None, "gaze_until": 0.0}
 
-    def test_person_beats_motion_then_hold_then_clear(self):
-        point = rb.update_gaze(self.state, 10.0, (0.25, 0.4), (0.9, 0.9))
-        self.assertEqual(point, (0.25, 0.4))
-        held = rb.update_gaze(self.state, 10.2, None, None)
-        self.assertEqual(held, (0.25, 0.4))
-        self.assertIsNone(rb.update_gaze(self.state, 20.0, None, None))
+    def test_largest_face_is_what_the_eyes_follow(self):
+        faces = [(10, 10, 20, 20), (100, 40, 80, 90)]
+        point = rb.face_gaze_point(faces, 640, 480)
+        self.assertAlmostEqual(point[0], (100 + 40) / 640.0)
+        self.assertAlmostEqual(point[1], (40 + 45) / 480.0)
+        self.assertIsNone(rb.face_gaze_point([], 640, 480))
+        looked = rb.update_gaze(self.state, 5.0, point)
+        self.assertEqual(looked, point)
+        # A missed frame holds the face, then the eyes idle.
+        self.assertIsNotNone(rb.update_gaze(self.state, 5.2, None))
+        self.assertIsNone(rb.update_gaze(self.state, 30.0, None))
         self.assertIsNone(self.state["gaze_x"])
 
-    def test_motion_used_when_no_person(self):
-        rb.update_gaze(self.state, 1.0, None, (0.8, 0.3))
-        self.assertAlmostEqual(self.state["gaze_x"], 0.8)
-        self.assertAlmostEqual(self.state["gaze_y"], 0.3)
+    def test_motion_does_not_move_the_eyes(self):
+        blob = rb.salient_motion([(20, 30, 200, 180, 55000)])
+        self.assertIsNotNone(blob)
+        self.assertIsNone(rb.update_gaze(self.state, 1.0, None))
+        self.assertIsNone(self.state["gaze_x"])
+        self.assertIsNone(self.state["gaze_y"])
 
     def test_largest_blob_wins(self):
         blobs = [(0, 0, 10, 10, 100), (40, 20, 80, 60, 5000), (10, 10, 30, 30, 2000)]
