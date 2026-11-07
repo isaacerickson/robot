@@ -1,40 +1,35 @@
 """
-robot_brain.py  -  Isaac's Human-Seeking Conversational Robot  (v2)
+robot_brain.py  -  Isaac's conversational robot.
+
 Hardware: Raspberry Pi 5, Adafruit Motor HAT, HC-SR04 ultrasonic,
-          USB webcam, USB microphone, speaker/amp, MG996R servo.
-Pi 5 COMPATIBLE - uses lgpio instead of RPi.GPIO.
+          USB webcam, USB microphone, speaker/amp, MG996R neck servo.
+Pi 5 compatible: lgpio, not RPi.GPIO.
 
-What's new in v2
-  - Brain is Grok (xAI API) instead of ChatGPT.
-  - Much better person detection: YOLOv8n (ultralytics) if installed,
-    otherwise falls back to HOG body + Haar face detection.
-  - Motion = "probably a person": movement puts the robot on ALERT. It
-    turns the camera toward the motion, checks every frame, and accepts
-    weaker detections for a few seconds.
-  - Steers the wheels toward the person (camera pans, body follows), so
-    the sonar actually points at them before trusting the distance.
-  - Detection uses "2 hits out of the last 5 frames" instead of
-    "3 in a row", so one missed frame no longer resets it.
-  - "I can't find you" no longer freezes the wheels for 5 seconds.
-  - Speech is thread-safe (no overlapping pyttsx3 calls).
+  - Chat and speech-to-text are Grok (xAI), via XAI_API_KEY and
+    https://api.x.ai/v1. Walk up and talk. The mic stays open, replies
+    are spoken, and the chat keeps going across turns. No keyboard.
+  - The eyes and the neck follow the largest thing moving in the camera,
+    and a detected person when one is in frame.
+  - The drive wheels stay off while MOTORS_ENABLED is False. The neck
+    can still look. Motors are stopped at startup so nothing lurches.
+  - Person detection uses YOLOv8n only if it is already installed.
+    Otherwise HOG + Haar. YOLO is not required.
 
-Install once (on the Pi: bash install_on_pi.sh):
-  pip install openai SpeechRecognition pyttsx3 adafruit-circuitpython-motorkit "Adafruit-Blinka-Raspberry-Pi-PWM>=1.0.2" lgpio
-  pip install ultralytics
-  ultralytics is optional. Without it, detection falls back to HOG and Haar.
-  Adafruit-Blinka-Raspberry-Pi-PWM is required to import MotorKit on current
-  Raspberry Pi OS; it is not pulled in by adafruit-circuitpython-motorkit.
+Install once on the Pi: bash install_on_pi.sh
 Run:
   export XAI_API_KEY="xai-..."
   python3 robot_brain.py
 """
 
+import io
+import json
 import os
-import cv2
 import time
+import wave
 import threading
 from collections import deque
 
+import cv2
 import lgpio
 import speech_recognition as sr
 import pyttsx3
@@ -44,7 +39,18 @@ from adafruit_motorkit import MotorKit
 # ---------------- Grok (xAI) settings ----------------
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "xai-YOUR_API_KEY_HERE")
 BASE_URL    = "https://api.x.ai/v1"
-MODEL       = "grok-3-mini"      # check console.x.ai for current model names
+STT_URL     = "https://api.x.ai/v1/stt"
+MODEL       = "grok-3-mini"                 # chat model; check console.x.ai
+STT_MODEL   = "grok-voice-transcribe-2.0"   # speech-to-text
+
+# Flip this to True when the robot should drive again. Exporting
+# MOTORS_ENABLED=1 (or 0) overrides the line below.
+MOTORS_ENABLED = False
+_motors_env = os.environ.get("MOTORS_ENABLED", "").strip().lower()
+if _motors_env in ("1", "true", "yes", "on"):
+    MOTORS_ENABLED = True
+elif _motors_env in ("0", "false", "no", "off"):
+    MOTORS_ENABLED = False
 
 # ---------------- Behavior tuning ----------------
 HUMAN_DISTANCE_CM         = 61
@@ -68,13 +74,19 @@ HIT_WINDOW                = 5      # ...of this many detector runs
 
 # Motion
 MOTION_MIN_AREA           = 1500   # pixels (on 320x240) to count as motion
-MOTION_ALERT_SECONDS      = 3.0    # how long motion keeps us on alert
-SERVO_SETTLE_SECONDS      = 0.35   # ignore motion right after camera moves
+MOTION_ALERT_SECONDS      = 3.0    # how long motion keeps us paying attention
+MOTION_WIDTH              = 320
+MOTION_HEIGHT             = 240
+GAZE_HOLD_SECONDS         = 0.7    # keep the last look target across brief gaps
+# Horizontal field of view, used only to cancel our own neck pan in the
+# frame-difference image. A rough Pi-camera value is enough.
+CAMERA_HFOV_DEG           = 62.0
 
 # Steering: camera servo angle where the body should turn to follow
 SERVO_CENTER              = 90.0
 SERVO_MIN, SERVO_MAX      = 30.0, 150.0
 STEER_DEADBAND_DEG        = 15.0   # within this, sonar points at the person
+SERVO_DEG_PER_SEC         = 40.0   # how fast the neck may chase a target
 
 SERVO_PIN                 = 18
 TRIG_PIN                  = 23
@@ -95,13 +107,18 @@ state = {
     "obstacle_distance_cm": 999,
     "last_human_seen":      0.0,
     "servo_angle":          SERVO_CENTER,
-    "alert_until":          0.0,     # motion alert active until this time
+    "alert_until":          0.0,     # motion keeps attention until this time
     "motors_moving":        False,
     "greeted":              False,
     "conversation":         [],
     "speaking":             False,
+    "listening":            False,
+    "last_heard":           0.0,
+    "gaze_x":               None,    # 0..1 in the camera frame, or None
+    "gaze_y":               None,
+    "gaze_until":           0.0,
     "running":              True,
-    "thinking":             False,   # waiting on Grok (face looks up)
+    "thinking":             False,   # waiting on Grok (face can glance up)
     "mood":                 "idle",  # idle / approach / maintain / searching
     "online":               True,    # internet reachable
 }
@@ -113,7 +130,17 @@ tts_engine   = None
 ai_client    = None
 tts_lock     = threading.Lock()
 recognizer   = sr.Recognizer()
-microphone   = sr.Microphone()
+_last_stt_log = 0.0
+
+
+def motors_enabled_setting(code_default, env_value):
+    """True only when driving should run. Env overrides the code flag."""
+    raw = ("" if env_value is None else str(env_value)).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(code_default)
 
 
 # ======================= Hardware helpers =======================
@@ -127,6 +154,26 @@ def set_servo_angle(angle):
     state["servo_angle"] = angle
     pulse_us = int(500 + (angle / 180.0) * 2000)
     lgpio.tx_servo(gpio_handle, SERVO_PIN, pulse_us)
+
+
+def servo_step_toward(current, frame_x, dt):
+    """Ease the neck toward frame_x (0..1, 0.5 is center).
+
+    Image-right lowers the angle, which is the direction the camera
+    already turns to face something on the right of the picture.
+    """
+    error = float(frame_x) - 0.5
+    if abs(error) < 0.035:
+        return current
+    desired = error * 50.0
+    cap = SERVO_DEG_PER_SEC * max(0.02, min(float(dt), 0.2))
+    step = max(-cap, min(cap, desired))
+    return max(SERVO_MIN, min(SERVO_MAX, current - step))
+
+
+def command_servo(angle):
+    if abs(angle - state["servo_angle"]) >= 0.4:
+        set_servo_angle(angle)
 
 
 def measure_distance_cm():
@@ -152,6 +199,13 @@ def measure_distance_cm():
 
 
 def _set_motors(left, right):
+    # Wheels stay at zero throttle until MOTORS_ENABLED is flipped on.
+    # Calling this still writes that zero so a leftover throttle cannot linger.
+    if not MOTORS_ENABLED:
+        left, right = 0, 0
+    if motor_left is None or motor_right is None:
+        state["motors_moving"] = False
+        return
     motor_left.throttle  = left
     motor_right.throttle = right
     state["motors_moving"] = (left != 0 or right != 0)
@@ -164,28 +218,252 @@ def motors_turn_right(speed=SPEED_TURN):_set_motors(speed, -speed)
 
 
 # ======================= Speech =======================
+def _new_tts():
+    engine = pyttsx3.init()   # espeak-ng on the Pi
+    engine.setProperty("rate",   165)
+    engine.setProperty("volume", 0.9)
+    return engine
+
 def speak(text):
+    """Say one line. A fresh espeak engine is made afterward so the next
+    line still speaks; pyttsx3 often goes silent after a single runAndWait."""
+    global tts_engine
     with tts_lock:
         state["speaking"] = True
-        print(f"[ROBOT] {text}")
-        tts_engine.say(text)
-        tts_engine.runAndWait()
-        state["speaking"] = False
+        try:
+            print(f"[ROBOT] {text}")
+            if tts_engine is None:
+                tts_engine = _new_tts()
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception as e:
+            print(f"[TTS] {e}")
+            tts_engine = None
+        finally:
+            if tts_engine is not None:
+                try:
+                    tts_engine.stop()
+                except Exception:
+                    pass
+                try:
+                    tts_engine = _new_tts()
+                except Exception as e:
+                    print(f"[TTS] could not restart voice ({e})")
+                    tts_engine = None
+            state["speaking"] = False
 
 def speak_async(text):
-    if state["speaking"]:
+    # Don't talk over a sentence already in progress, and don't talk into
+    # the open microphone or the robot will answer itself.
+    if state["speaking"] or state.get("listening"):
         return
     state["speaking"] = True   # set now so nothing else talks over it
     threading.Thread(target=speak, args=(text,), daemon=True).start()
 
-def listen_for_speech(timeout=5):
-    with microphone as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+
+def _input_score(device):
+    name = (device.get("name") or "").lower()
+    score = 0
+    if "usb" in name:
+        score += 50
+    if "mic" in name or "microphone" in name:
+        score += 20
+    if "webcam" in name or "camera" in name:
+        score += 15
+    if "pulse" in name or name.strip() == "default":
+        score += 5
+    if "hdmi" in name or "vc4" in name:
+        score -= 40
+    if "monitor" in name:
+        score -= 30
+    return score
+
+
+def select_input_device(devices):
+    """Pick a microphone index from PyAudio device dicts, or None for the default.
+
+    Prefers a USB / mic input. HDMI and monitor sources are skipped. A
+    non-positive score means nothing looked like a microphone, so the
+    caller should use the system default.
+    """
+    inputs = [d for d in devices if int(d.get("max_input_channels") or 0) > 0]
+    if not inputs:
+        return None
+    best = max(inputs, key=lambda d: (_input_score(d), -int(d.get("index", 0))))
+    if _input_score(best) <= 0:
+        return None
+    return int(best["index"])
+
+
+def describe_input_devices():
+    try:
+        import pyaudio
+    except Exception as e:
+        print(f"[MIC] PyAudio is not available ({e})")
+        return []
+    found = []
+    pa = pyaudio.PyAudio()
+    try:
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            found.append({
+                "index": int(info.get("index", i)),
+                "name": str(info.get("name", "")),
+                "max_input_channels": int(info.get("maxInputChannels") or 0),
+            })
+    finally:
+        pa.terminate()
+    return found
+
+
+def open_microphone():
+    try:
+        devices = describe_input_devices()
+    except Exception as e:
+        print(f"[MIC] Could not list microphones ({e})")
+        devices = []
+    for d in devices:
+        print(f"[MIC] device {d['index']}: {d['name']} (inputs={d['max_input_channels']})")
+    index = select_input_device(devices)
+    chosen = None
+    for d in devices:
+        if index is not None and int(d["index"]) == index:
+            chosen = d["name"]
+    print("[MIC] Selected input: {}".format(chosen if chosen else "system default"))
+    try:
+        mic = sr.Microphone(device_index=index) if index is not None else sr.Microphone()
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.4)
+        return mic
+    except Exception as e:
+        print(f"[MIC] Could not open microphone ({e})")
+        return None
+
+
+def pcm_to_wav(pcm, sample_rate, sample_width):
+    """Wrap mono PCM in a WAV container. No resample, so audioop is not required."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(int(sample_width))
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def wav_bytes_from_audio(audio):
+    try:
+        data = audio.get_wav_data()
+        if data:
+            return data
+    except Exception as e:
+        print(f"[MIC] WAV encode failed ({e})")
+    raw = audio.get_raw_data()
+    return pcm_to_wav(raw, audio.sample_rate, audio.sample_width)
+
+
+def clean_transcript(text):
+    if not text:
+        return None
+    text = " ".join(str(text).replace("\x00", " ").split())
+    letters = [c for c in text if c.isalnum()]
+    if len(letters) < 2:
+        return None
+    return text
+
+
+def build_stt_body(wav_bytes, boundary):
+    """Multipart body for POST /v1/stt. The file field must be last."""
+    chunks = []
+    for name, value in (("model", STT_MODEL), ("language", "en")):
+        chunks.append(
+            "--{b}\r\nContent-Disposition: form-data; name=\"{n}\"\r\n\r\n{v}\r\n".format(
+                b=boundary, n=name, v=value).encode("utf-8"))
+    chunks.append(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n".format(b=boundary).encode("utf-8"))
+    chunks.append(wav_bytes)
+    chunks.append("\r\n--{b}--\r\n".format(b=boundary).encode("utf-8"))
+    return b"".join(chunks)
+
+
+def transcript_from_stt_payload(payload):
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        return None
+    return clean_transcript(payload.get("text") or "")
+
+
+def _log_stt(msg):
+    global _last_stt_log
+    now = time.time()
+    if now - _last_stt_log > 15:
+        print(msg)
+        _last_stt_log = now
+
+
+def transcribe_with_grok(wav_bytes):
+    """Send one utterance to Grok speech-to-text. Returns text or None."""
+    import urllib.error
+    import urllib.request
+    boundary = "IsaacRobot" + os.urandom(8).hex()
+    body = build_stt_body(wav_bytes, boundary)
+    req = urllib.request.Request(
+        STT_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + XAI_API_KEY,
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            "User-Agent": "isaac-robot/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = b""
         try:
-            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=10)
-            return recognizer.recognize_google(audio)
-        except (sr.WaitTimeoutError, sr.UnknownValueError, sr.RequestError):
-            return None
+            detail = e.read(240)
+        except Exception:
+            pass
+        _log_stt("[STT] HTTP {code} {detail!r}".format(code=e.code, detail=detail[:180]))
+        return None
+    except Exception as e:
+        _log_stt("[STT] {0}".format(e))
+        return None
+    try:
+        return transcript_from_stt_payload(raw)
+    except Exception as e:
+        _log_stt("[STT] Bad response ({0})".format(e))
+        return None
+
+
+def listen_for_speech(mic, timeout=3, phrase_time_limit=12):
+    """Block until a phrase ends or timeout. None if nobody spoke."""
+    state["listening"] = True
+    audio = None
+    try:
+        with mic as source:
+            audio = recognizer.listen(source, timeout=timeout,
+                                      phrase_time_limit=phrase_time_limit)
+    except sr.WaitTimeoutError:
+        return None
+    finally:
+        state["listening"] = False
+    if audio is None:
+        return None
+    try:
+        wav = wav_bytes_from_audio(audio)
+    except Exception as e:
+        print(f"[MIC] Could not read audio ({e})")
+        return None
+    if not wav:
+        return None
+    return transcribe_with_grok(wav)
 
 
 # ======================= Grok brain =======================
@@ -211,6 +489,15 @@ def ai_respond(user_text):
     if len(state["conversation"]) > 40:
         state["conversation"] = state["conversation"][-40:]
     return reply
+
+
+def _chat_active(now):
+    """True while a spoken exchange is still going, even if vision lost them."""
+    if state["speaking"] or state["thinking"]:
+        return True
+    if state["conversation"] and (now - state.get("last_heard", 0.0)) < CONVERSATION_IDLE_TIMEOUT:
+        return True
+    return False
 
 
 # ======================= Person detectors =======================
@@ -316,10 +603,74 @@ class PersonDetector:
         return out
 
 
+def box_center_norm(box, frame_w, frame_h):
+    x, y, w, h = box[:4]
+    return ((x + w / 2.0) / float(frame_w), (y + h / 2.0) / float(frame_h))
+
+
+def salient_motion(blobs, min_area=MOTION_MIN_AREA,
+                   width=MOTION_WIDTH, height=MOTION_HEIGHT):
+    """Largest blob at or above min_area.
+
+    blobs are (x, y, w, h, area) on the motion image. Returns
+    (x_norm, y_norm, area) or None.
+    """
+    big = [b for b in blobs if b[4] >= min_area]
+    if not big:
+        return None
+    x, y, w, h, area = max(big, key=lambda b: b[4])
+    return ((x + w / 2.0) / float(width), (y + h / 2.0) / float(height), float(area))
+
+
+def update_gaze(state, now, person_xy, motion_xy, hold_s=GAZE_HOLD_SECONDS):
+    """Point gaze at a person when one is in frame, otherwise at motion.
+
+    person_xy and motion_xy are (x, y) in 0..1 camera space, or None.
+    The last target is held briefly so the eyes do not flicker off.
+    Returns the smoothed (x, y) or None when there is nothing to look at.
+    """
+    chosen = person_xy if person_xy is not None else motion_xy
+    if chosen is not None:
+        px, py = chosen
+        ox, oy = state.get("gaze_x"), state.get("gaze_y")
+        if ox is None or oy is None:
+            state["gaze_x"], state["gaze_y"] = float(px), float(py)
+        else:
+            state["gaze_x"] = ox + (float(px) - ox) * 0.5
+            state["gaze_y"] = oy + (float(py) - oy) * 0.5
+        state["gaze_until"] = now + hold_s
+        return (state["gaze_x"], state["gaze_y"])
+    if state.get("gaze_x") is not None and now < state.get("gaze_until", 0):
+        return (state["gaze_x"], state["gaze_y"])
+    state["gaze_x"] = None
+    state["gaze_y"] = None
+    return None
+
+
+def shift_gray(gray, shift_px):
+    """Shift a grayscale image horizontally, filling the gap with the edge."""
+    shift_px = int(shift_px)
+    if shift_px == 0:
+        return gray
+    h, w = gray.shape[:2]
+    if abs(shift_px) >= w:
+        return gray
+    out = gray.copy()
+    if shift_px > 0:
+        out[:, shift_px:] = gray[:, :-shift_px]
+        out[:, :shift_px] = gray[:, :1]
+    else:
+        span = -shift_px
+        out[:, :-span] = gray[:, span:]
+        out[:, -span:] = gray[:, -1:]
+    return out
+
+
 # ======================= Motion detection =======================
 class MotionDetector:
-    """Simple frame differencing. Returns (x_center_fraction, area) of the
-    biggest moving blob, or None."""
+    """Frame differencing. Returns (x_norm, y_norm, area) of the biggest
+    moving blob, or None. pan_degrees compensates a small neck move so the
+    robot does not chase its own camera."""
 
     def __init__(self):
         self.prev = None
@@ -327,25 +678,28 @@ class MotionDetector:
     def reset(self):
         self.prev = None
 
-    def detect(self, frame):
-        small = cv2.resize(frame, (320, 240))
+    def detect(self, frame, pan_degrees=0.0):
+        small = cv2.resize(frame, (MOTION_WIDTH, MOTION_HEIGHT))
         gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (21, 21), 0)
         if self.prev is None:
             self.prev = gray
             return None
-        diff = cv2.absdiff(self.prev, gray)
+        prev = self.prev
+        if abs(pan_degrees) >= 0.3:
+            # Angle up turns the camera toward image-left, so the scene
+            # slides toward image-right. Shift the previous frame to match.
+            shift = int(round(float(pan_degrees) * (MOTION_WIDTH / CAMERA_HFOV_DEG)))
+            prev = shift_gray(prev, shift)
         self.prev = gray
+        diff = cv2.absdiff(prev, gray)
         _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
         th = cv2.dilate(th, None, iterations=2)
         contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-        biggest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(biggest)
-        if area < MOTION_MIN_AREA:
-            return None
-        x, y, w, h = cv2.boundingRect(biggest)
-        return ((x + w / 2.0) / 320.0, area)
+        blobs = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            blobs.append((x, y, w, h, cv2.contourArea(contour)))
+        return salient_motion(blobs)
 
 
 # ======================= Threads =======================
@@ -392,11 +746,20 @@ def vision_thread():
     frame_no = 0
     bad_reads = 0
     last_heartbeat = time.time()
+    last_motion_log = 0.0
+    last_person_xy = None
+    servo_at_prev = state["servo_angle"]
+    last_tick = time.time()
 
     while state["running"]:
         now = time.time()
+        dt = min(0.2, max(0.0, now - last_tick))
+        last_tick = now
         if now - last_heartbeat >= 10.0:
-            print(f"[VISION] frames={frame_no} person_hits={sum(hits)} detector={detector.kind}")
+            gx, gy = state.get("gaze_x"), state.get("gaze_y")
+            gaze = "none" if gx is None else "{0:.2f},{1:.2f}".format(gx, gy)
+            print("[VISION] frames={frames} person_hits={hits} detector={kind} gaze={gaze}".format(
+                frames=frame_no, hits=sum(hits), kind=detector.kind, gaze=gaze))
             last_heartbeat = now
 
         ret, frame = cap.read()
@@ -407,6 +770,7 @@ def vision_thread():
                 cap.release()
                 cap = open_camera()
                 bad_reads = 0
+                motion.reset()
                 if cap is None:
                     return
             else:
@@ -416,53 +780,63 @@ def vision_thread():
         frame_no += 1
         now = time.time()
 
-        # ---- Motion: only trust it when the camera and wheels are still ----
-        camera_still = (now - _last_servo_move) > SERVO_SETTLE_SECONDS
-        if camera_still and not state["motors_moving"]:
-            m = motion.detect(frame)
-            if m and not state["human_visible"]:
-                mx, area = m
-                if now > state["alert_until"]:
-                    print(f"[VISION] Motion seen (area {int(area)}) - paying attention")
-                state["alert_until"] = now + MOTION_ALERT_SECONDS
-                # Glance toward the motion
-                error = mx - 0.5
-                set_servo_angle(state["servo_angle"] - error * 40.0)
+        # Motion runs whenever the wheels are still. A small neck pan is
+        # compensated; a big jump resets the reference frame instead.
+        pan = state["servo_angle"] - servo_at_prev
+        if state["motors_moving"] or abs(pan) > 12:
+            motion.reset()
+            seen = None
         else:
-            motion.reset()   # avoid fake motion from our own movement
+            seen = motion.detect(frame, pan_degrees=pan)
+        servo_at_prev = state["servo_angle"]
+
+        if seen and not state["human_visible"]:
+            mx, my, area = seen
+            if now >= state["alert_until"] and now - last_motion_log > 2.0:
+                print("[VISION] Motion at ({0:.2f}, {1:.2f}) area {2}".format(mx, my, int(area)))
+                last_motion_log = now
+            state["alert_until"] = now + MOTION_ALERT_SECONDS
 
         alert = now < state["alert_until"]
 
-        # ---- Person detection: every frame when alert, less often when calm ----
+        # Person detection: every frame when alert, less often when calm.
         every_n = DETECT_EVERY_N_ALERT if alert else DETECT_EVERY_N_NORMAL
+        if frame_no % every_n == 0:
+            boxes = detector.detect(frame, alert)
+            hits.append(1 if boxes else 0)
+            if boxes:
+                misses_in_a_row = 0
+                if sum(hits) >= HITS_NEEDED:
+                    state["human_visible"]   = True
+                    state["last_human_seen"] = now
+                    state["alert_until"]     = now + MOTION_ALERT_SECONDS
+                biggest = max(boxes, key=lambda b: b[2] * b[3])
+                last_person_xy = box_center_norm(biggest, frame.shape[1], frame.shape[0])
+            else:
+                misses_in_a_row += 1
+                limit = 12 if alert else 8
+                if misses_in_a_row >= limit:
+                    state["human_visible"] = False
+                    last_person_xy = None
+
+        if not state["human_visible"]:
+            last_person_xy = None
+
+        motion_xy = (seen[0], seen[1]) if seen else None
+        if state["human_visible"] and last_person_xy is not None:
+            target = update_gaze(state, now, last_person_xy, None)
+        else:
+            target = update_gaze(state, now, None, motion_xy)
+
+        if target is not None:
+            command_servo(servo_step_toward(state["servo_angle"], target[0], dt))
+        elif not state["human_visible"] and now >= state["alert_until"]:
+            # Nothing to look at: drift the neck back toward center.
+            nudged = state["servo_angle"] + (SERVO_CENTER - state["servo_angle"]) * min(0.5, dt * 0.6)
+            command_servo(nudged)
+
         if frame_no % every_n != 0:
             time.sleep(0.01)
-            continue
-
-        boxes = detector.detect(frame, alert)
-        hits.append(1 if boxes else 0)
-
-        if boxes:
-            misses_in_a_row = 0
-            if sum(hits) >= HITS_NEEDED:
-                state["human_visible"]   = True
-                state["last_human_seen"] = now
-                state["alert_until"]     = now + MOTION_ALERT_SECONDS
-                x, y, w, h, _ = max(boxes, key=lambda b: b[2] * b[3])
-                center_x = (x + w / 2.0) / frame.shape[1]
-                error    = center_x - 0.5
-                if abs(error) > 0.05:
-                    set_servo_angle(state["servo_angle"] - error * 25.0)
-        else:
-            misses_in_a_row += 1
-            # Stay "visible" a bit longer when alert, it's probably still there
-            limit = 12 if alert else 8
-            if misses_in_a_row >= limit:
-                state["human_visible"] = False
-            if not alert and not state["human_visible"]:
-                # Drift camera back to center when calm
-                set_servo_angle(state["servo_angle"] +
-                                (SERVO_CENTER - state["servo_angle"]) * 0.05)
 
     cap.release()
 
@@ -480,24 +854,56 @@ def sonar_thread():
 
 
 def conversation_thread():
+    """Listen whenever we are not already talking, then answer with Grok.
+
+    A person does not have to be classified first. Seeing someone (or
+    motion) still plays one short greeting if the chat is empty. Later
+    turns keep the same conversation.
+    """
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 0.75
+    recognizer.phrase_threshold = 0.3
+    recognizer.non_speaking_duration = 0.4
+    mic = None
+    next_try = 0.0
     while state["running"]:
-        if not state["human_visible"] or state["speaking"]:
-            time.sleep(0.2)
+        if state["speaking"] or state["thinking"]:
+            time.sleep(0.1)
             continue
-        if not state["greeted"]:
-            time.sleep(0.5)
-            if state["human_visible"]:
-                speak("I see you, human.")
-                time.sleep(0.5)
-                speak("How are you doing, human?")
-                state["greeted"]      = True
-                state["conversation"] = []
-        if state["greeted"] and state["human_visible"]:
-            human_text = listen_for_speech(timeout=5)
-            if human_text:
-                print(f"[HUMAN] {human_text}")
-                speak(ai_respond(human_text))
-        time.sleep(0.1)
+        now = time.time()
+        if mic is None:
+            if now < next_try:
+                time.sleep(0.2)
+                continue
+            mic = open_microphone()
+            if mic is None:
+                next_try = time.time() + 5
+                continue
+
+        try:
+            heard = listen_for_speech(mic, timeout=3, phrase_time_limit=12)
+        except Exception as e:
+            print(f"[MIC] Listen failed ({e}); reopening microphone")
+            mic = None
+            next_try = time.time() + 2
+            continue
+
+        if heard:
+            print(f"[HUMAN] {heard}")
+            state["greeted"] = True
+            state["last_heard"] = time.time()
+            reply = ai_respond(heard)
+            speak(reply)
+            state["last_heard"] = time.time()
+            time.sleep(0.3)   # let the speaker finish before the mic opens
+            continue
+
+        now = time.time()
+        present = state["human_visible"] or now < state["alert_until"]
+        if present and not state["greeted"] and not state["conversation"]:
+            speak("I see you, human. How are you doing, human?")
+            state["greeted"] = True
+            time.sleep(0.3)
 
 
 def network_thread():
@@ -521,6 +927,8 @@ def network_thread():
 def steer_toward_person():
     """Turn the body so the camera ends up centered. Returns True if
     already facing the person (so it's OK to drive forward)."""
+    if not MOTORS_ENABLED:
+        return True
     offset = state["servo_angle"] - SERVO_CENTER   # + = person to the left
     if offset > STEER_DEADBAND_DEG:
         motors_turn_left()
@@ -532,9 +940,15 @@ def steer_toward_person():
 
 
 def movement_loop():
+    """Approach / search state machine.
+
+    While MOTORS_ENABLED is false every drive call writes zero throttle,
+    so this loop still updates mood for the face and never turns a wheel.
+    """
     robot_state = "IDLE"
     last_search_speech = 0.0
     search_turn_until  = 0.0
+    motors_stop()
 
     while state["running"]:
         now             = time.time()
@@ -543,6 +957,7 @@ def movement_loop():
         human_vis       = state["human_visible"]
         time_since_seen = now - state["last_human_seen"]
         alert           = now < state["alert_until"]
+        chatting        = _chat_active(now)
         state["mood"]   = robot_state.lower()
 
         if robot_state == "IDLE":
@@ -552,7 +967,7 @@ def movement_loop():
                 state["greeted"] = False
                 robot_state = "APPROACH"
             elif alert:
-                # Motion seen: sit still and look (camera is already turning)
+                # Motion seen: sit still and look (the neck is already turning)
                 pass
 
         elif robot_state == "APPROACH":
@@ -561,7 +976,7 @@ def movement_loop():
                 print("[STATE] APPROACH -> SEARCHING")
                 robot_state = "SEARCHING"
             elif not steer_toward_person():
-                pass  # turning to face them
+                pass  # turning to face them, only when the wheels are enabled
             elif obstacle < OBSTACLE_STOP_CM:
                 motors_stop()
             elif human_dist <= HUMAN_DISTANCE_CM:
@@ -590,22 +1005,25 @@ def movement_loop():
                 motors_stop()
                 print("[STATE] SEARCHING -> MAINTAIN")
                 robot_state = "MAINTAIN"
-            elif alert:
-                # Motion while searching: stop spinning and look at it
+            elif alert or state["listening"] or state["speaking"] or state["thinking"] or chatting:
+                # Hold still while looking at motion or while a conversation
+                # is in progress, so the mic is not drowned by the wheels.
                 motors_stop()
             elif time_since_seen > LOST_HUMAN_TIMEOUT:
-                if now - last_search_speech > SEARCH_SPEECH_COOLDOWN:
+                if (not chatting and not state["listening"]
+                        and now - last_search_speech > SEARCH_SPEECH_COOLDOWN):
                     speak_async("I can't find you, human.")
                     last_search_speech = now
                 # Turn in short bursts, then pause so the camera gets a
-                # sharp, still frame (and motion detection works)
+                # sharp, still frame (and motion detection works).
+                # These calls are zero throttle while MOTORS_ENABLED is false.
                 if now < search_turn_until:
                     motors_turn_right(SPEED_TURN)
                 elif now < search_turn_until + 0.8:
                     motors_stop()
                 else:
                     search_turn_until = now + 0.4
-                if time_since_seen > CONVERSATION_IDLE_TIMEOUT:
+                if time_since_seen > CONVERSATION_IDLE_TIMEOUT and not chatting:
                     motors_stop()
                     print("[STATE] SEARCHING -> IDLE")
                     state["greeted"]      = False
@@ -627,10 +1045,18 @@ def main():
     kit         = MotorKit()
     motor_left  = kit.motor1
     motor_right = kit.motor2
+    # Kill any leftover throttle before speech, vision, or the face start.
+    motors_stop()
+    if MOTORS_ENABLED:
+        print("[MOTORS] Drive motors are ON.")
+    else:
+        print("[MOTORS] Drive motors are OFF. Set MOTORS_ENABLED = True in robot_brain.py to drive again.")
 
-    tts_engine = pyttsx3.init()   # uses espeak-ng on the Pi
-    tts_engine.setProperty("rate",   165)
-    tts_engine.setProperty("volume", 0.9)
+    try:
+        tts_engine = _new_tts()
+    except Exception as e:
+        print(f"[TTS] Voice unavailable ({e})")
+        tts_engine = None
 
     ai_client = OpenAI(api_key=XAI_API_KEY, base_url=BASE_URL)
 
@@ -648,21 +1074,33 @@ def main():
         t.start()
 
     try:
-        try:
-            from face import run_face
-            run_face(state)           # runs until Esc/q or shutdown
-        except Exception as e:        # no screen? keep the robot running anyway
-            print(f"[FACE] Face disabled: {e}")
-            while state["running"]:
-                time.sleep(0.5)
+        while state["running"]:
+            try:
+                from face import run_face
+                run_face(state)
+            except Exception as e:
+                # A face error must not take speech, motors, or vision down.
+                print(f"[FACE] Face error ({e}); retrying")
+                time.sleep(2)
+                continue
+            if not state["running"]:
+                break
+            print("[FACE] Face window ended; reopening")
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
         state["running"] = False
         time.sleep(0.3)
-        motors_stop()
-        lgpio.tx_servo(gpio_handle, SERVO_PIN, 0)
-        lgpio.gpiochip_close(gpio_handle)
+        try:
+            motors_stop()
+        except Exception as e:
+            print(f"[MOTORS] stop failed ({e})")
+        try:
+            lgpio.tx_servo(gpio_handle, SERVO_PIN, 0)
+            lgpio.gpiochip_close(gpio_handle)
+        except Exception as e:
+            print(f"[GPIO] close failed ({e})")
         print("Robot offline.")
 
 
