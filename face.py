@@ -10,6 +10,7 @@ the 800x480 DSI the face reads wider than a plain 16:9 fit.
 Reads the shared `state` dict from robot_brain.py:
   speaking       -> mouth moves
   gaze_x/gaze_y  -> eyes look at a face in the camera (0..1), else idle
+  (no face required for blinking; the lids close on their own)
   thinking       -> eyes glance up when nothing else is there to look at
   online         -> small "no internet" note when offline
 If face_assets/ is missing, falls back to the cartoon face.
@@ -77,6 +78,37 @@ def map_art(x, y, window_w, window_h, crop=FACE_CROP):
     left, top, right, bottom = crop
     sx, sy = face_art_scale(window_w, window_h, crop)
     return (x - left) * sx, (y - top) * sy
+
+
+# A full lid close and reopen. Long enough to read as a blink at 30 fps,
+# and not tied to whether a face is in the camera.
+BLINK_SECONDS = 0.26
+
+
+def blink_envelope(elapsed, duration=BLINK_SECONDS):
+    """How closed the eyelids are, from 0 open to 1 shut.
+
+    The middle of the blink is held shut so the closed-eye photo reads as
+    real lids, then they open again. Past the end this returns 0.
+    """
+    if elapsed < 0 or elapsed >= duration or duration <= 0:
+        return 0.0
+    close = duration * 0.40
+    hold_end = duration * 0.62
+    if elapsed <= close:
+        return elapsed / close
+    if elapsed <= hold_end:
+        return 1.0
+    return max(0.0, 1.0 - (elapsed - hold_end) / (duration - hold_end))
+
+
+def blink_is_finished(elapsed, duration=BLINK_SECONDS):
+    return elapsed >= duration
+
+
+def blink_due(now, next_blink):
+    """True when the next idle blink should start. Ignores face detection."""
+    return now >= next_blink
 
 
 def gaze_offsets(state, now, wander):
@@ -354,7 +386,7 @@ def run_face(state):
 
         look_x = look_y = 0.0
         wander = (0.0, (0.0, 0.0))
-        next_blink = time.time() + random.uniform(2, 5)
+        next_blink = time.time() + random.uniform(0.8, 2.2)
         blink_t    = -1.0
         mouth = mouth_goal = 0.0
         next_mouth = 0.0
@@ -375,16 +407,19 @@ def run_face(state):
             look_x += (tx - look_x) * 0.22
             look_y += (ty - look_y) * 0.22
 
-            # ---- blink ----
-            if now > next_blink and blink_t < 0:
+            # ---- blink: idle animation, whether or not a face is in frame ----
+            if blink_due(now, next_blink) and blink_t < 0:
                 blink_t = now
             blink = 0.0
             if blink_t >= 0:
-                p = (now - blink_t) / 0.08
-                blink = 1 - abs(1 - p) if p < 2 else 0.0
-                if p >= 2:
+                elapsed = now - blink_t
+                if blink_is_finished(elapsed):
                     blink_t = -1
-                    next_blink = now + (0.25 if random.random() < 0.15 else random.uniform(2.0, 6.0))
+                    # Mostly a few seconds apart. Sometimes a quick second blink.
+                    gap = 0.28 if random.random() < 0.15 else random.uniform(2.4, 6.0)
+                    next_blink = now + gap
+                else:
+                    blink = blink_envelope(elapsed)
 
             # ---- mouth ----
             if speaking:
@@ -406,7 +441,7 @@ def run_face(state):
                 roi.blit(e["iris"], (round(ix), round(iy)))
                 roi.blit(e["mask"], (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
                 screen.blit(roi, e["pos"])
-            blend("blink", min(1.0, blink * 2.5))
+            blend("blink", blink)
             blend("talk_mid", min(1.0, mouth * 2))
             blend("talk_open", (mouth - 0.5) * 2)
 

@@ -62,6 +62,8 @@ SPEED_TURN                = 0.35
 LOST_HUMAN_TIMEOUT        = 4.0
 CONVERSATION_IDLE_TIMEOUT = 30.0
 SEARCH_SPEECH_COOLDOWN    = 8.0    # seconds between "I can't find you"
+IDLE_HELLO_SECONDS        = 240.0   # empty-room hello, not a tight loop
+STARTUP_HELLO             = "Hello. I am here if you want to talk."
 
 # Vision
 FRAME_W, FRAME_H          = 640, 480
@@ -110,6 +112,7 @@ state = {
     "alert_until":          0.0,     # motion keeps attention until this time
     "motors_moving":        False,
     "greeted":              False,
+    "last_hello":           0.0,
     "conversation":         [],
     "speaking":             False,
     "listening":            False,
@@ -130,7 +133,6 @@ tts_engine   = None
 ai_client    = None
 tts_lock     = threading.Lock()
 recognizer   = sr.Recognizer()
-_last_stt_log = 0.0
 
 
 def motors_enabled_setting(code_default, env_value):
@@ -361,12 +363,14 @@ def open_microphone():
     print("[MIC] Selected input: {}".format(chosen if chosen else "system default"))
     try:
         mic = sr.Microphone(device_index=index) if index is not None else sr.Microphone()
+        # Playback on this same adapter inflates the measured noise floor,
+        # so wait until our own voice has finished before calibrating.
+        wait_until_quiet()
         with mic as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.4)
-        # Freeze the threshold. The dynamic one drifts down into hiss and
-        # then listen() records several seconds of noise before giving up.
-        recognizer.energy_threshold = max(float(recognizer.energy_threshold), 280.0)
+        recognizer.energy_threshold = cap_energy_threshold(recognizer.energy_threshold)
         recognizer.dynamic_energy_threshold = False
+        print("[MIC] energy_threshold={0:.0f}".format(recognizer.energy_threshold))
         return mic
     except Exception as e:
         print(f"[MIC] Could not open microphone ({e})")
@@ -395,11 +399,14 @@ def wav_bytes_from_audio(audio):
     return pcm_to_wav(raw, audio.sample_rate, audio.sample_width)
 
 
-# Below this, a clip is hiss or a click, not someone talking. Sending it
-# to speech-to-text makes up phrases and the reply comes back late.
+# The 1/8 inch jack on the USB adapter is quiet. Live levels were about
+# rms 148 and peak 340 for the room, so the old 250/700 gate dropped speech.
 MIN_SPEECH_SECONDS = 0.30
-MIN_SPEECH_RMS = 250.0
-MIN_SPEECH_PEAK = 700
+MIN_SPEECH_RMS = 165.0
+MIN_SPEECH_PEAK = 420
+# Cap, not a floor. Speech into the same adapter was pushing this into the
+# hundreds and then real words never crossed it. 200 sits in 160-210.
+ENERGY_THRESHOLD_CAP = 200.0
 
 
 def pcm_stats(pcm, sample_width):
@@ -469,11 +476,75 @@ def transcript_from_stt_payload(payload):
 
 
 def _log_stt(msg):
-    global _last_stt_log
-    now = time.time()
-    if now - _last_stt_log > 15:
-        print(msg)
-        _last_stt_log = now
+    """Log every ignored clip and STT line. A cooldown hid failures."""
+    print(msg)
+
+
+def cap_energy_threshold(measured, cap=ENERGY_THRESHOLD_CAP):
+    """Keep the recognizer threshold from rising above the quiet jack mic."""
+    return min(float(measured), float(cap))
+
+
+def wait_until_quiet(timeout=8.0):
+    """Block while the robot is speaking so mic calibration hears the room."""
+    deadline = time.time() + timeout
+    while state.get("speaking") and time.time() < deadline and state.get("running", True):
+        time.sleep(0.05)
+
+
+def ready_to_calibrate(speaking):
+    return not speaking
+
+
+def usb_audio_commands(card="Device"):
+    """Unmute the USB speakers, enable the jack mic, mute mic sidetone."""
+    return [
+        ["amixer", "-c", card, "sset", "Speaker", "100%", "unmute"],
+        ["amixer", "-c", card, "sset", "Mic", "100%", "unmute", "cap"],
+        ["amixer", "-c", card, "sset", "Mic", "playback", "mute"],
+    ]
+
+
+def prepare_usb_audio():
+    """Route the Unitek adapter before the first hello."""
+    import subprocess
+    ok = True
+    for cmd in usb_audio_commands():
+        try:
+            result = subprocess.run(cmd, check=False, capture_output=True, timeout=5, text=True)
+        except Exception as e:
+            print("[AUDIO] {0} failed ({1})".format(" ".join(cmd), e))
+            ok = False
+            continue
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else str(result.returncode)
+            print("[AUDIO] {0} failed ({1})".format(" ".join(cmd), tail))
+            ok = False
+    if ok:
+        print("[AUDIO] USB adapter speakers unmuted, mic capture on")
+    return ok
+
+
+def idle_hello_due(now, last_hello, speaking, listening, thinking, conversation,
+                   interval=IDLE_HELLO_SECONDS):
+    """True when an empty room should hear hello again.
+
+    Not gated on a person or a face. A recent hello, an open mic, or an
+    ongoing chat holds it off so it cannot loop.
+    """
+    if speaking or listening or thinking:
+        return False
+    if conversation:
+        return False
+    if not last_hello:
+        return True
+    return (now - last_hello) >= interval
+
+
+def say_lost_person_line(motors_enabled):
+    """The lost-person line drives TTS on a silent robot and blocks the mic."""
+    return bool(motors_enabled)
 
 
 def transcribe_with_grok(wav_bytes):
@@ -1015,6 +1086,13 @@ def conversation_thread():
             continue
 
         now = time.time()
+        if idle_hello_due(now, state.get("last_hello", 0.0), state["speaking"],
+                          state["listening"], state["thinking"], state["conversation"]):
+            speak("Hello.")
+            state["last_hello"] = time.time()
+            state["greeted"] = True
+            time.sleep(0.3)
+            continue
         present = state["human_visible"] or now < state["alert_until"]
         if present and not state["greeted"] and not state["conversation"]:
             speak("I see you, human. How are you doing, human?")
@@ -1126,7 +1204,8 @@ def movement_loop():
                 # is in progress, so the mic is not drowned by the wheels.
                 motors_stop()
             elif time_since_seen > LOST_HUMAN_TIMEOUT:
-                if (not chatting and not state["listening"]
+                if (say_lost_person_line(MOTORS_ENABLED) and not chatting
+                        and not state["listening"]
                         and now - last_search_speech > SEARCH_SPEECH_COOLDOWN):
                     speak_async("I can't find you, human.")
                     last_search_speech = now
@@ -1177,7 +1256,14 @@ def main():
     ai_client = OpenAI(api_key=XAI_API_KEY, base_url=BASE_URL)
 
     print("Robot brain starting up...")
-    speak("I am online. Looking for humans.")
+    prepare_usb_audio()
+    # Say hello before the listener starts, and stamp last_hello so the
+    # conversation thread does not immediately say it again. This does not
+    # wait for a person or a face.
+    state["last_hello"] = time.time()
+    speak(STARTUP_HELLO)
+    state["last_hello"] = time.time()
+    state["greeted"] = True
 
     threads = [
         threading.Thread(target=vision_thread,       daemon=True, name="Vision"),
