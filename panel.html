@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Robot</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #10141c; color: #f2f4f8;
+    font: 18px/1.3 system-ui, sans-serif;
+    padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 22px; margin: 4px 0 12px; }
+  .modes { display: flex; gap: 8px; margin-bottom: 12px; }
+  .modes button { flex: 1; }
+  button, input[type="text"] {
+    font: inherit; border: 0; border-radius: 14px; color: inherit;
+  }
+  button {
+    background: #243044; min-height: 64px; padding: 12px;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  button.on { background: #1f7a4d; }
+  button.drive { background: #2c3a52; font-size: 22px; font-weight: 700; }
+  button.stop { background: #7a2e2e; }
+  button:active { filter: brightness(1.25); }
+  #view {
+    width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+    background: #000; border-radius: 14px; display: block;
+  }
+  .pad { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+  .pad .wide { grid-column: 1 / -1; }
+  form { display: flex; gap: 8px; margin: 12px 0; }
+  input[type="text"] {
+    flex: 1; min-height: 64px; padding: 0 14px; background: #1b2330;
+  }
+  #say { min-width: 96px; background: #1f4f8a; }
+  #hear { width: 100%; background: #3a3458; }
+  #note { min-height: 1.3em; color: #c5d0e0; margin: 8px 0; }
+  #heard { margin: 0; padding-left: 18px; }
+  #heard li { margin: 4px 0; }
+</style>
+</head>
+<body>
+  <h1>Robot</h1>
+  <div class="modes">
+    <button type="button" id="automate" class="on">AUTOMATE</button>
+    <button type="button" id="control">CONTROL</button>
+  </div>
+  <img id="view" alt="Camera" width="320" height="240">
+  <div class="pad" id="pad">
+    <button type="button" class="drive wide" data-dir="forward">Forward</button>
+    <button type="button" class="drive" data-dir="left">Left</button>
+    <button type="button" class="drive" data-dir="right">Right</button>
+    <button type="button" class="drive wide" data-dir="back">Back</button>
+    <button type="button" class="stop wide" id="stop">Stop</button>
+  </div>
+  <form id="talk">
+    <input id="line" type="text" maxlength="300" placeholder="Type what it should say" autocomplete="off">
+    <button type="submit" id="say">Say</button>
+  </form>
+  <button type="button" id="hear">Hear microphone</button>
+  <p id="note">Automate: wheels stay off. Control: hold a direction to drive.</p>
+  <ol id="heard"></ol>
+<script>
+const note = document.getElementById("note");
+const view = document.getElementById("view");
+let mode = "automate";
+let holdTimer = 0;
+let hearing = false;
+let hearStop = null;
+let audioCtx = null;
+
+function paint() {
+  document.getElementById("automate").classList.toggle("on", mode === "automate");
+  document.getElementById("control").classList.toggle("on", mode === "control");
+  document.getElementById("pad").style.opacity = mode === "control" ? "1" : "0.45";
+}
+
+async function post(url, fields) {
+  const body = new URLSearchParams(fields);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "request failed");
+  return data;
+}
+
+async function setMode(next) {
+  const data = await post("/api/mode", {mode: next});
+  mode = data.mode || next;
+  if (mode !== "control") stopHear();
+  paint();
+  note.textContent = mode === "control"
+    ? "Hold a direction. Let go and the wheels stop."
+    : "Automate: the wheels will not drive on their own.";
+}
+
+document.getElementById("automate").onclick = () => setMode("automate");
+document.getElementById("control").onclick = () => setMode("control");
+
+function drive(dir) {
+  if (mode !== "control") return;
+  post("/api/drive", {dir}).catch(() => {});
+}
+
+function startHold(dir) {
+  if (mode !== "control") {
+    note.textContent = "Switch to Control to drive.";
+    return;
+  }
+  clearInterval(holdTimer);
+  drive(dir);
+  holdTimer = setInterval(() => drive(dir), 200);
+}
+
+function endHold() {
+  clearInterval(holdTimer);
+  holdTimer = 0;
+  if (mode === "control") drive("stop");
+}
+
+document.querySelectorAll(".drive").forEach((btn) => {
+  btn.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    btn.setPointerCapture(ev.pointerId);
+    startHold(btn.dataset.dir);
+  });
+  btn.addEventListener("pointerup", endHold);
+  btn.addEventListener("pointercancel", endHold);
+});
+document.getElementById("stop").onclick = endHold;
+
+document.getElementById("talk").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const line = document.getElementById("line");
+  const text = line.value.trim();
+  if (!text) return;
+  try {
+    await post("/api/say", {text});
+    line.value = "";
+  } catch (err) {
+    note.textContent = err.message;
+  }
+};
+
+function stopHear() {
+  hearing = false;
+  if (hearStop) hearStop.abort();
+  hearStop = null;
+  document.getElementById("hear").textContent = "Hear microphone";
+}
+
+async function playMic() {
+  if (mode !== "control") {
+    note.textContent = "Switch to Control to hear the jack mic. Automate keeps it for conversation; lines it understood are listed below.";
+    return;
+  }
+  if (hearing) { stopHear(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  audioCtx = audioCtx || new AC();
+  await audioCtx.resume();
+  hearStop = new AbortController();
+  hearing = true;
+  document.getElementById("hear").textContent = "Stop listening";
+  const res = await fetch("/mic", {signal: hearStop.signal});
+  if (!res.ok || !res.body) {
+    stopHear();
+    note.textContent = "Microphone is busy. Wait a second and try again.";
+    return;
+  }
+  const reader = res.body.getReader();
+  let pending = new Uint8Array(0);
+  let nextTime = audioCtx.currentTime + 0.15;
+  while (hearing) {
+    const {value, done} = await reader.read();
+    if (done || !value) break;
+    const merged = new Uint8Array(pending.length + value.length);
+    merged.set(pending, 0);
+    merged.set(value, pending.length);
+    const usable = merged.length - (merged.length % 2);
+    pending = merged.slice(usable);
+    const samples = usable / 2;
+    if (!samples) continue;
+    const buffer = audioCtx.createBuffer(1, samples, 16000);
+    const channel = buffer.getChannelData(0);
+    const view = new DataView(merged.buffer, merged.byteOffset, usable);
+    for (let i = 0; i < samples; i++) channel[i] = view.getInt16(i * 2, true) / 32768;
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(audioCtx.destination);
+    const startAt = Math.max(nextTime, audioCtx.currentTime + 0.05);
+    src.start(startAt);
+    nextTime = startAt + buffer.duration;
+  }
+  stopHear();
+}
+document.getElementById("hear").onclick = () => { playMic().catch((err) => { note.textContent = err.message; stopHear(); }); };
+
+setInterval(() => { view.src = "/camera.jpg?t=" + Date.now(); }, 250);
+setInterval(async () => {
+  try {
+    const res = await fetch("/api/status");
+    const data = await res.json();
+    if (data.mode && data.mode !== mode && !holdTimer) {
+      mode = data.mode;
+      paint();
+    }
+    const list = document.getElementById("heard");
+    list.innerHTML = "";
+    (data.heard || []).forEach((line) => {
+      const item = document.createElement("li");
+      item.textContent = line;
+      list.appendChild(item);
+    });
+  } catch (err) { /* the next poll retries */ }
+}, 1000);
+paint();
+</script>
+</body>
+</html>

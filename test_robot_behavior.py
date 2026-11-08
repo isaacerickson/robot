@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 import types
 import unittest
 import wave
@@ -66,6 +67,7 @@ _install_stubs()
 
 import face  # noqa: E402
 import robot_brain as rb  # noqa: E402
+import panel  # noqa: E402
 
 
 class FacePanelTests(unittest.TestCase):
@@ -370,6 +372,144 @@ class TrackingTests(unittest.TestCase):
         shifted = rb.shift_gray(gray, 1)
         self.assertEqual(int(shifted[1, 3]), 9)
         self.assertEqual(int(shifted[1, 2]), 0)
+
+
+class PanelTests(unittest.TestCase):
+    def setUp(self):
+        class Motor:
+            def __init__(self):
+                self.throttle = 0
+        self.left = Motor()
+        self.right = Motor()
+        rb.motor_left = self.left
+        rb.motor_right = self.right
+        rb.state["drive_mode"] = "automate"
+        rb.state["heard_lines"] = []
+        rb.state["speaking"] = False
+        rb.manual_stop()
+
+    def tearDown(self):
+        rb.state["drive_mode"] = "automate"
+        rb.manual_stop()
+        rb.motor_left = None
+        rb.motor_right = None
+        rb.state["speaking"] = False
+
+    def test_control_drives_even_while_automate_motors_are_off(self):
+        self.assertFalse(rb.MOTORS_ENABLED)
+        self.assertEqual(rb.set_drive_mode("control"), "control")
+        self.assertEqual(self.left.throttle, 0)
+        self.assertEqual(rb.manual_drive("forward"), "forward")
+        self.assertAlmostEqual(self.left.throttle, rb.MANUAL_SPEED)
+        self.assertAlmostEqual(self.right.throttle, rb.MANUAL_SPEED)
+        self.assertEqual(rb.manual_drive("left"), "left")
+        self.assertLess(self.left.throttle, 0)
+        self.assertGreater(self.right.throttle, 0)
+        self.assertEqual(rb.manual_drive("stop"), "stop")
+        self.assertEqual(self.left.throttle, 0)
+        self.assertEqual(self.right.throttle, 0)
+
+    def test_release_timeout_and_automate_stop_the_wheels(self):
+        rb.set_drive_mode("control")
+        rb.manual_drive("back")
+        self.assertLess(self.left.throttle, 0)
+        rb.state["manual_stamp"] = time.time() - 5
+        self.assertTrue(rb.expire_manual_drive())
+        self.assertEqual(self.left.throttle, 0)
+        rb.manual_drive("right")
+        self.assertGreater(self.left.throttle, 0)
+        self.assertEqual(rb.set_drive_mode("automate"), "automate")
+        self.assertEqual(self.left.throttle, 0)
+        self.assertIsNone(rb.manual_drive("forward"))
+        self.assertEqual(self.left.throttle, 0)
+        self.assertEqual(self.right.throttle, 0)
+
+    def test_typed_speech_uses_speak_and_not_the_chat(self):
+        said = []
+        spoken = rb.say_typed("  hello there  ", speaker=said.append)
+        self.assertEqual(spoken, "hello there")
+        self.assertEqual(said, ["hello there"])
+        self.assertIsNone(rb.say_typed("   ", speaker=said.append))
+        self.assertEqual(rb.clean_say_text("x" * 500), "x" * 300)
+        self.assertTrue(rb.state["speaking"])
+        status = rb.panel_status()
+        self.assertNotIn("key", json.dumps(status).lower())
+        self.assertNotIn("robot.env", json.dumps(status))
+        rb.remember_heard("can you hear me")
+        self.assertIn("can you hear me", rb.panel_status()["heard"])
+
+    def test_page_has_controls_and_no_secrets(self):
+        page = panel.load_page()
+        for label in ("AUTOMATE", "CONTROL", "Forward", "Back", "Left", "Right", "Say", "Hear microphone"):
+            self.assertIn(label, page)
+        lowered = page.lower()
+        self.assertNotIn("robot.env", lowered)
+        self.assertNotIn("xai", lowered)
+        self.assertNotIn("api_key", lowered)
+        fields = panel.fields_from_request("/api/drive?dir=forward", "dir=stop", "")
+        self.assertEqual(fields["dir"], "stop")
+        fields = panel.fields_from_request("/api/say", '{"text": "hi"}', "application/json")
+        self.assertEqual(fields["text"], "hi")
+
+
+class PanelHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = panel.start_panel(port=8765)
+        time.sleep(0.05)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.server is not None:
+            cls.server.shutdown()
+            cls.server.server_close()
+        rb.state["drive_mode"] = "automate"
+        rb.manual_stop()
+
+    def test_phone_routes_stop_on_mode_change(self):
+        import urllib.error
+        import urllib.request
+
+        def post(path, body):
+            req = urllib.request.Request(
+                "http://127.0.0.1:8765" + path, data=body.encode(), method="POST")
+            with urllib.request.urlopen(req, timeout=2) as res:
+                return json.loads(res.read().decode())
+
+        def get(path):
+            with urllib.request.urlopen("http://127.0.0.1:8765" + path, timeout=2) as res:
+                return res.status, res.read()
+
+        status, page = get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"CONTROL", page)
+        self.assertNotIn(b"robot.env", page.lower())
+        self.assertEqual(post("/api/mode", "mode=control")["mode"], "control")
+        self.assertEqual(post("/api/drive", "dir=forward")["dir"], "forward")
+        self.assertGreater(rb.state["manual_left"], 0)
+        self.assertEqual(post("/api/drive", "dir=stop")["dir"], "stop")
+        self.assertEqual(rb.state["manual_left"], 0)
+        self.assertEqual(post("/api/mode", "mode=automate")["mode"], "automate")
+        self.assertEqual(rb.state["manual_left"], 0)
+        refused = post("/api/drive", "dir=forward")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(rb.state["manual_left"], 0)
+        said = []
+        original = rb.speak
+        rb.speak = lambda text: said.append(text)
+        try:
+            self.assertTrue(post("/api/say", "text=beep")["ok"])
+            deadline = time.time() + 1
+            while not said and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(said, ["beep"])
+        finally:
+            rb.speak = original
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8765/mic", timeout=2)
+            self.fail("mic stream should refuse while automate")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 409)
 
 
 if __name__ == "__main__":
