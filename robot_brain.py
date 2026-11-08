@@ -12,6 +12,7 @@ Pi 5 compatible: lgpio, not RPi.GPIO.
     they idle. That look does not drive the wheels.
   - The drive wheels stay off while MOTORS_ENABLED is False. The neck
     can still look. Motors are stopped at startup so nothing lurches.
+    A phone panel on port 8080 can drive them only while CONTROL is held.
   - Person detection uses YOLOv8n only if it is already installed.
     Otherwise HOG + Haar. YOLO is not required.
 
@@ -58,6 +59,8 @@ OBSTACLE_STOP_CM          = 25
 SPEED_NORMAL              = 0.6
 SPEED_SLOW                = 0.35
 SPEED_TURN                = 0.35
+MANUAL_SPEED              = 0.45   # phone hold-to-drive, not full blast
+MANUAL_HOLD_SECONDS       = 0.45   # no fresh hold -> stop (release or drop)
 
 LOST_HUMAN_TIMEOUT        = 4.0
 CONVERSATION_IDLE_TIMEOUT = 30.0
@@ -114,6 +117,13 @@ state = {
     "speaking":             False,
     "listening":            False,
     "last_heard":           0.0,
+    "ignore_listen_until":  0.0,
+    "drive_mode":           "automate",  # automate | control
+    "manual_dir":           "stop",
+    "manual_stamp":         0.0,
+    "manual_left":          0.0,
+    "manual_right":         0.0,
+    "heard_lines":          [],
     "gaze_x":               None,    # 0..1 in the camera frame, or None
     "gaze_y":               None,
     "gaze_until":           0.0,
@@ -129,6 +139,7 @@ motor_right  = None
 tts_engine   = None
 ai_client    = None
 tts_lock     = threading.Lock()
+motor_lock   = threading.Lock()
 recognizer   = sr.Recognizer()
 _last_stt_log = 0.0
 
@@ -198,17 +209,143 @@ def measure_distance_cm():
     return ((pulse_end - pulse_start) * 34300) / 2
 
 
+def _write_throttles(left, right):
+    """Write wheel throttles. Used by hand-driving even when automate is off."""
+    left = float(left)
+    right = float(right)
+    with motor_lock:
+        state["manual_left"] = left
+        state["manual_right"] = right
+        state["motors_moving"] = (left != 0 or right != 0)
+        if motor_left is None or motor_right is None:
+            return
+        motor_left.throttle = left
+        motor_right.throttle = right
+
+
 def _set_motors(left, right):
-    # Wheels stay at zero throttle until MOTORS_ENABLED is flipped on.
-    # Calling this still writes that zero so a leftover throttle cannot linger.
+    # Autonomous path. Zero while MOTORS_ENABLED is false, and never
+    # overwrite a person who is holding a direction in CONTROL.
+    if state.get("drive_mode") == "control":
+        return
     if not MOTORS_ENABLED:
         left, right = 0, 0
-    if motor_left is None or motor_right is None:
-        state["motors_moving"] = False
-        return
-    motor_left.throttle  = left
-    motor_right.throttle = right
-    state["motors_moving"] = (left != 0 or right != 0)
+    _write_throttles(left, right)
+
+
+def manual_stop():
+    state["manual_dir"] = "stop"
+    state["manual_stamp"] = time.time()
+    _write_throttles(0, 0)
+
+
+def normalize_direction(value):
+    value = ("" if value is None else str(value)).strip().lower()
+    if value == "backward":
+        return "back"
+    if value in ("forward", "back", "left", "right", "stop"):
+        return value
+    return None
+
+
+def set_drive_mode(mode):
+    """Switch AUTOMATE / CONTROL. Either change stops the wheels now."""
+    mode = "control" if str(mode).strip().lower() == "control" else "automate"
+    manual_stop()
+    state["drive_mode"] = mode
+    manual_stop()
+    print("[PANEL] mode {0}".format(mode))
+    return mode
+
+
+def manual_drive(direction):
+    """Hold-to-move. Ignored unless CONTROL is on. stop always zeros."""
+    direction = normalize_direction(direction)
+    if direction is None:
+        return None
+    if state.get("drive_mode") != "control":
+        manual_stop()
+        return None
+    if direction == "stop":
+        manual_stop()
+        return "stop"
+    if direction == "forward":
+        left = right = MANUAL_SPEED
+    elif direction == "back":
+        left = right = -MANUAL_SPEED
+    elif direction == "left":
+        left, right = -SPEED_TURN, SPEED_TURN
+    else:
+        left, right = SPEED_TURN, -SPEED_TURN
+    state["manual_dir"] = direction
+    state["manual_stamp"] = time.time()
+    _write_throttles(left, right)
+    return direction
+
+
+def expire_manual_drive(now=None):
+    """Stop if CONTROL lost its hold (finger up or the phone went away)."""
+    if state.get("drive_mode") != "control":
+        return False
+    if state.get("manual_dir") in (None, "", "stop"):
+        return False
+    now = time.time() if now is None else now
+    if now - state.get("manual_stamp", 0.0) <= MANUAL_HOLD_SECONDS:
+        return False
+    manual_stop()
+    return True
+
+
+def drive_watchdog():
+    while state["running"]:
+        try:
+            expire_manual_drive()
+        except Exception as e:
+            print("[PANEL] drive watchdog ({0})".format(e))
+            manual_stop()
+        time.sleep(0.05)
+
+
+def clean_say_text(text):
+    if text is None:
+        return None
+    text = " ".join(str(text).replace("\x00", " ").split())
+    if not text:
+        return None
+    return text[:300]
+
+
+def say_typed(text, speaker=None):
+    """Speak typed words on the USB speakers. Does not ask Grok."""
+    cleaned = clean_say_text(text)
+    if not cleaned:
+        return None
+    # Mark speaking before the audio starts so a listen already in progress
+    # is thrown away and the robot does not answer its own voice.
+    state["speaking"] = True
+    state["ignore_listen_until"] = time.time() + 1.5
+    if speaker is not None:
+        speaker(cleaned)
+        return cleaned
+    threading.Thread(target=speak, args=(cleaned,), daemon=True).start()
+    return cleaned
+
+
+def remember_heard(text):
+    lines = state.setdefault("heard_lines", [])
+    lines.append(str(text))
+    del lines[:-12]
+
+
+def panel_status():
+    """Phone status. Never includes env files or API keys."""
+    return {
+        "mode": state.get("drive_mode", "automate"),
+        "speaking": bool(state.get("speaking")),
+        "listening": bool(state.get("listening")) and state.get("drive_mode") != "control",
+        "heard": list(state.get("heard_lines") or []),
+        "motors_enabled": bool(MOTORS_ENABLED),
+    }
 
 def motors_stop():                      _set_motors(0, 0)
 def motors_forward(speed=SPEED_NORMAL): _set_motors(speed, speed)
@@ -251,6 +388,7 @@ def speak(text):
                     print(f"[TTS] could not restart voice ({e})")
                     tts_engine = None
             state["speaking"] = False
+            state["ignore_listen_until"] = time.time() + 0.7
 
 def speak_async(text):
     # Don't talk over a sentence already in progress, and don't talk into
@@ -545,6 +683,12 @@ def listen_for_speech(mic, timeout=3, phrase_time_limit=8):
         return None
     if not wav:
         return None
+    # Drop the clip if we were talking, or if the phone took the mic for
+    # CONTROL, so the robot does not answer its own speaker.
+    if state.get("speaking") or state.get("drive_mode") == "control":
+        return None
+    if time.time() < state.get("ignore_listen_until", 0.0):
+        return None
     return transcribe_with_grok(wav)
 
 
@@ -821,6 +965,35 @@ class MotionDetector:
 
 
 # ======================= Threads =======================
+_jpeg_lock = threading.Lock()
+_latest_jpeg = b""
+_jpeg_tick = 0
+
+
+def publish_camera_frame(frame):
+    """Keep one modest JPEG for the phone. The vision thread owns the camera."""
+    global _latest_jpeg, _jpeg_tick
+    _jpeg_tick += 1
+    if _jpeg_tick % 2:
+        return
+    try:
+        small = cv2.resize(frame, (320, 240))
+        quality = int(getattr(cv2, "IMWRITE_JPEG_QUALITY", 1))
+        ok, buf = cv2.imencode(".jpg", small, [quality, 55])
+    except Exception:
+        return
+    if not ok:
+        return
+    data = buf.tobytes() if hasattr(buf, "tobytes") else bytes(buf)
+    with _jpeg_lock:
+        _latest_jpeg = data
+
+
+def latest_jpeg():
+    with _jpeg_lock:
+        return _latest_jpeg
+
+
 def open_camera():
     """Try /dev/video0-9 and return the first capture that yields a frame.
     If none work, log an error and try again every 5 seconds."""
@@ -897,6 +1070,7 @@ def vision_thread():
         bad_reads = 0
         frame_no += 1
         now = time.time()
+        publish_camera_frame(frame)
 
         # Motion runs whenever the wheels are still. A small neck pan is
         # compensated; a big jump resets the reference frame instead.
@@ -983,6 +1157,11 @@ def conversation_thread():
     mic = None
     next_try = 0.0
     while state["running"]:
+        if state.get("drive_mode") == "control":
+            # The phone is using the jack mic. Let go of it.
+            mic = None
+            time.sleep(0.15)
+            continue
         if state["speaking"] or state["thinking"]:
             time.sleep(0.1)
             continue
@@ -1006,6 +1185,7 @@ def conversation_thread():
 
         if heard:
             print(f"[HUMAN] {heard}")
+            remember_heard(heard)
             state["greeted"] = True
             state["last_heard"] = time.time()
             reply = ai_respond(heard)
@@ -1067,6 +1247,10 @@ def movement_loop():
     motors_stop()
 
     while state["running"]:
+        if state.get("drive_mode") == "control":
+            # Hand driving owns the wheels. Do not zero them from here.
+            time.sleep(0.05)
+            continue
         now             = time.time()
         obstacle        = state["obstacle_distance_cm"]
         human_dist      = state["human_distance_cm"]
@@ -1188,6 +1372,12 @@ def main():
     ]
     for t in threads:
         t.start()
+    threading.Thread(target=drive_watchdog, daemon=True, name="DriveWatch").start()
+    try:
+        from panel import start_panel
+        start_panel()
+    except Exception as e:
+        print("[PANEL] Phone panel did not start ({0})".format(e))
 
     try:
         while state["running"]:
@@ -1207,8 +1397,10 @@ def main():
         print("\nShutting down...")
     finally:
         state["running"] = False
+        state["drive_mode"] = "automate"
         time.sleep(0.3)
         try:
+            manual_stop()
             motors_stop()
         except Exception as e:
             print(f"[MOTORS] stop failed ({e})")

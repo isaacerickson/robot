@@ -34,6 +34,20 @@ right. In robot_brain.py, MOTORS_ENABLED is False. Set that to True (or
 export MOTORS_ENABLED=1 before start) when it should drive again. The
 neck can still turn to look. The wheels are stopped on startup.
 
+PHONE PANEL
+===========
+On the same Wi-Fi, open this in the phone's browser:
+
+    http://robot.local:8080
+
+AUTOMATE leaves the wheels off and keeps listening for conversation.
+The page lists lines the robot understood. CONTROL is hand driving:
+hold Forward, Back, Left, or Right, and let go to stop. The camera
+picture is the robot's webcam. Hear microphone plays the 1/8 inch jack
+(the USB audio adapter, not the camera mic) and only works in CONTROL,
+so it does not fight conversation listening. Type a line and press Say
+to speak it on the USB speakers. The page does not show the API key.
+
 REMOTE STATUS
 =============
 The Pi can upload a short status file so it can be read from GitHub without
