@@ -16,8 +16,19 @@ from urllib.parse import parse_qs, urlparse
 import robot_brain as rb
 
 PANEL_PORT = 8080
+MIC_OPEN_ATTEMPTS = 6
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PAGE = ""
+
+
+def mic_retry_delay(failures):
+    """Seconds to wait after a failed mic open. Never a tight loop.
+
+    Opening PyAudio while the jack is still taken aborts the process inside
+    PortAudio, so a 0.4s retry storm is worse than waiting.
+    """
+    failures = max(1, int(failures))
+    return min(8.0, 0.5 * (2 ** (failures - 1)))
 
 
 def load_page():
@@ -92,10 +103,26 @@ class MicRelay:
         except Exception as exc:
             print("[PANEL] microphone unavailable ({0})".format(exc))
             return
-        while not self.stop_flag and rb.state.get("drive_mode") == "control" and rb.state.get("running", True):
+        failures = 0
+        was_busy = True
+        while (not self.stop_flag and rb.state.get("drive_mode") == "control"
+               and rb.state.get("running", True) and failures < MIC_OPEN_ATTEMPTS):
+            # Conversation may still be inside listen(). Opening PyAudio on
+            # the same ALSA device then aborts the process.
+            if not rb.capture_is_free():
+                was_busy = True
+                time.sleep(0.2)
+                continue
+            if was_busy:
+                time.sleep(0.35)
+                was_busy = False
+                if self.stop_flag or not rb.capture_is_free():
+                    continue
             stream = None
             audio = None
             try:
+                if not rb.capture_is_free():
+                    continue
                 devices = rb.describe_input_devices()
                 index = rb.select_input_device(devices)
                 audio = pyaudio.PyAudio()
@@ -107,6 +134,7 @@ class MicRelay:
                     input_device_index=index,
                     frames_per_buffer=1024,
                 )
+                failures = 0
                 print("[PANEL] streaming jack mic to the phone")
                 while (not self.stop_flag and rb.state.get("drive_mode") == "control"
                        and rb.state.get("running", True)):
@@ -120,8 +148,11 @@ class MicRelay:
                     if not clients:
                         time.sleep(0.05)
             except Exception as exc:
-                print("[PANEL] mic stream ({0})".format(exc))
-                time.sleep(0.4)
+                failures += 1
+                delay = mic_retry_delay(failures)
+                print("[PANEL] mic stream ({0}); retry in {1:.1f}s ({2}/{3})".format(
+                    exc, delay, failures, MIC_OPEN_ATTEMPTS))
+                time.sleep(delay)
             finally:
                 try:
                     if stream is not None:
@@ -134,7 +165,10 @@ class MicRelay:
                         audio.terminate()
                 except Exception:
                     pass
-        print("[PANEL] mic stream stopped")
+        if failures >= MIC_OPEN_ATTEMPTS:
+            print("[PANEL] mic stream stopped after repeated open failures")
+        else:
+            print("[PANEL] mic stream stopped")
 
 
 RELAY = MicRelay()

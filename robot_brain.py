@@ -25,6 +25,7 @@ Run:
 import io
 import json
 import os
+import sys
 import time
 import wave
 import threading
@@ -249,10 +250,16 @@ def normalize_direction(value):
 
 
 def set_drive_mode(mode):
-    """Switch AUTOMATE / CONTROL. Either change stops the wheels now."""
+    """Switch AUTOMATE / CONTROL. Either change stops the wheels now.
+
+    CONTROL also closes the conversation microphone. Dropping the Python
+    name is not enough while listen() still holds the ALSA capture stream.
+    """
     mode = "control" if str(mode).strip().lower() == "control" else "automate"
     manual_stop()
     state["drive_mode"] = mode
+    if mode == "control":
+        release_capture_device()
     manual_stop()
     print("[PANEL] mode {0}".format(mode))
     return mode
@@ -651,6 +658,39 @@ def transcribe_with_grok(wav_bytes):
         return None
 
 
+def release_capture_device():
+    """Close the jack capture stream if conversation is holding it.
+
+    SpeechRecognition keeps the PyAudio stream open for the whole listen().
+    Setting the local mic variable to None does not close it, and a second
+    open then aborts the process inside PortAudio.
+    """
+    mic = state.get("active_mic")
+    if mic is None:
+        return False
+    stream = getattr(mic, "stream", None)
+    if stream is None:
+        return False
+    try:
+        stream.close()
+    except Exception as exc:
+        print("[MIC] release capture ({0})".format(exc))
+
+    def _already_closed():
+        return None
+
+    try:
+        stream.close = _already_closed
+    except Exception:
+        pass
+    return True
+
+
+def capture_is_free():
+    """True when conversation is not inside a listen() that owns the jack."""
+    return state.get("active_mic") is None and not state.get("listening")
+
+
 def listen_for_speech(mic, timeout=3, phrase_time_limit=8):
     """Block until a phrase ends or timeout. None if nobody spoke.
 
@@ -658,6 +698,7 @@ def listen_for_speech(mic, timeout=3, phrase_time_limit=8):
     Grok and cannot come back as invented sentences.
     """
     state["listening"] = True
+    state["active_mic"] = mic
     audio = None
     try:
         with mic as source:
@@ -665,8 +706,13 @@ def listen_for_speech(mic, timeout=3, phrase_time_limit=8):
                                       phrase_time_limit=phrase_time_limit)
     except sr.WaitTimeoutError:
         return None
+    except Exception as exc:
+        print("[MIC] listen ended ({0})".format(exc))
+        return None
     finally:
         state["listening"] = False
+        if state.get("active_mic") is mic:
+            state["active_mic"] = None
     if audio is None:
         return None
     try:
@@ -1412,5 +1458,20 @@ def main():
         print("Robot offline.")
 
 
+def share_process_module():
+    """Make `import robot_brain` return this process's running module.
+
+    `python3 robot_brain.py` executes this file as __main__. panel.py then
+    imports robot_brain. Without this alias that import builds a second
+    module whose state, Motor HAT, and camera buffer are not the live ones.
+    """
+    if __name__ == "__main__":
+        sys.modules["robot_brain"] = sys.modules[__name__]
+    return sys.modules.get("robot_brain", sys.modules[__name__])
+
+
 if __name__ == "__main__":
-    main()
+    share_process_module()
+    # Tests set this so they can execute the file as __main__ without GPIO.
+    if os.environ.get("ROBOT_BRAIN_IMPORT_ONLY") != "1":
+        main()

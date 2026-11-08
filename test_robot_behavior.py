@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 import types
@@ -161,6 +162,38 @@ class KioskTests(unittest.TestCase):
     def test_restore_is_debounced(self):
         face._face_display["last_restore"] = face.time.time()
         self.assertIsNone(face.restore_face_fullscreen("WINDOWMINIMIZED"))
+
+    def test_dsi_panel_is_enabled_and_headless_output_is_off(self):
+        text = """
+DSI-2 "Raspberry Pi display"
+  Physical size: 154x86 mm
+  Enabled: yes
+  Position: 0,0
+  Modes:
+    800x480 px, 60.000000 Hz (current)
+NOOP-1 "Headless output 2"
+  Enabled: yes
+  Position: 0,0
+  Modes:
+    1920x1080 px, 60.000000 Hz (current)
+HDMI-A-1 "Sceptre"
+  Enabled: yes
+  Modes:
+    2560x1080 px, 60.000000 Hz (current)
+"""
+        outputs = face.parse_wlr_outputs(text)
+        self.assertEqual([item["name"] for item in outputs], ["DSI-2", "NOOP-1", "HDMI-A-1"])
+        self.assertTrue(outputs[1]["headless"])
+        self.assertFalse(outputs[0]["headless"])
+        self.assertIn((800, 480), outputs[0]["modes"])
+        commands = face.display_commands(outputs)
+        self.assertIn(["wlr-randr", "--output", "NOOP-1", "--off"], commands)
+        enabled = [cmd for cmd in commands if "--on" in cmd]
+        self.assertEqual(enabled, [[
+            "wlr-randr", "--output", "DSI-2", "--on", "--pos", "0,0", "--mode", "800x480",
+        ]])
+        joined = " ".join(" ".join(cmd) for cmd in commands)
+        self.assertNotIn("HDMI-A-1", joined)
 
     def test_face_code_does_not_stop_the_robot(self):
         for name in ("face.py", "face_cartoon.py"):
@@ -510,6 +543,113 @@ class PanelHttpTests(unittest.TestCase):
             self.fail("mic stream should refuse while automate")
         except urllib.error.HTTPError as exc:
             self.assertEqual(exc.code, 409)
+
+    def test_camera_route_returns_the_frame_vision_published(self):
+        import urllib.request
+        rb._latest_jpeg = b"\xff\xd8\xff\xd9"
+        with urllib.request.urlopen("http://127.0.0.1:8765/camera.jpg", timeout=2) as res:
+            self.assertEqual(res.status, 200)
+            self.assertEqual(res.read(), b"\xff\xd8\xff\xd9")
+
+
+class SharedModuleTests(unittest.TestCase):
+    def test_panel_uses_the_module_started_as_main(self):
+        script = r'''
+import importlib.machinery, importlib.util, os, sys, types
+os.environ["ROBOT_BRAIN_IMPORT_ONLY"] = "1"
+
+def stub(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+class Recognizer:
+    def __init__(self):
+        self.dynamic_energy_threshold = False
+        self.pause_threshold = 0.8
+        self.phrase_threshold = 0.3
+        self.non_speaking_duration = 0.3
+        self.energy_threshold = 300
+
+class Microphone:
+    def __init__(self, device_index=None):
+        self.device_index = device_index
+
+stub("speech_recognition", Recognizer=Recognizer, Microphone=Microphone,
+     WaitTimeoutError=type("WaitTimeoutError", (Exception,), {}),
+     UnknownValueError=Exception, RequestError=Exception)
+stub("openai", OpenAI=type("OpenAI", (), {"__init__": lambda self, *a, **k: None}))
+stub("adafruit_motorkit", MotorKit=type("MotorKit", (), {"__init__": lambda self, *a, **k: None}))
+stub("lgpio")
+stub("cv2")
+stub("pyttsx3", init=lambda: None)
+
+path = "robot_brain.py"
+loader = importlib.machinery.SourceFileLoader("__main__", path)
+spec = importlib.util.spec_from_loader("__main__", loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["__main__"] = mod
+loader.exec_module(mod)
+
+import robot_brain
+import panel
+assert panel.rb is mod, (panel.rb, mod)
+assert robot_brain is mod
+mod._latest_jpeg = b"\xff\xd8vision"
+assert panel.rb.latest_jpeg() == b"\xff\xd8vision"
+
+class Motor:
+    def __init__(self):
+        self.throttle = 0.0
+mod.motor_left = Motor()
+mod.motor_right = Motor()
+mod.MOTORS_ENABLED = False
+assert mod.set_drive_mode("control") == "control"
+assert mod.manual_drive("forward") == "forward"
+assert mod.motor_left.throttle == mod.MANUAL_SPEED
+assert panel.rb.motor_left is mod.motor_left
+assert panel.rb.state is mod.state
+print("SHARE_OK")
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=HERE,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertIn("SHARE_OK", result.stdout, result.stderr)
+
+    def test_control_releases_the_open_microphone(self):
+        class Stream:
+            def __init__(self):
+                self.closed = 0
+            def close(self):
+                self.closed += 1
+        class Mic:
+            def __init__(self):
+                self.stream = Stream()
+        mic = Mic()
+        rb.state["active_mic"] = mic
+        rb.state["listening"] = True
+        self.assertFalse(rb.capture_is_free())
+        self.assertEqual(rb.set_drive_mode("control"), "control")
+        self.assertEqual(mic.stream.closed, 1)
+        mic.stream.close()
+        self.assertEqual(mic.stream.closed, 1)
+        rb.state["active_mic"] = None
+        rb.state["listening"] = False
+        self.assertTrue(rb.capture_is_free())
+        rb.set_drive_mode("automate")
+
+    def test_mic_open_failures_back_off(self):
+        self.assertGreaterEqual(panel.mic_retry_delay(1), 0.5)
+        self.assertGreater(panel.mic_retry_delay(3), panel.mic_retry_delay(1))
+        self.assertLessEqual(panel.mic_retry_delay(12), 8.0)
+        with open(os.path.join(HERE, "panel.py")) as handle:
+            self.assertNotIn("time.sleep(0.4)", handle.read())
 
 
 if __name__ == "__main__":

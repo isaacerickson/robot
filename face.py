@@ -150,8 +150,98 @@ def release_pygame_mixer():
         print("[FACE] Released SDL mixer {0} so speech can use the speakers".format(was))
 
 
+def parse_wlr_outputs(text):
+    """Parse `wlr-randr` text into output dicts.
+
+    Header lines are not indented: `DSI-2 "..."` or `NOOP-1 "Headless output 2"`.
+    Mode lines look like `800x480 px, 60 Hz`.
+    """
+    outputs = []
+    current = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if not raw[:1].isspace():
+            name, _, rest = raw.strip().partition(" ")
+            description = rest.strip().strip('"')
+            label = (name + " " + description).lower()
+            current = {
+                "name": name,
+                "description": description,
+                "modes": [],
+                "headless": name.upper().startswith("NOOP") or "headless" in label,
+            }
+            outputs.append(current)
+            continue
+        if current is None:
+            continue
+        token = raw.strip().split()[0]
+        width, _, height = token.partition("x")
+        if width.isdigit() and height.isdigit() and "px" in raw:
+            current["modes"].append((int(width), int(height)))
+    return outputs
+
+
+def display_commands(outputs):
+    """Turn headless NOOP outputs off and enable the 800x480 DSI panel.
+
+    labwc was advertising a 1920x1080 headless output at 0,0 as well as the
+    real DSI panel. pygame only saw 1920x1080, so the face never appeared.
+    """
+    commands = []
+    chosen = None
+    chosen_mode = None
+    for output in outputs:
+        if output.get("headless"):
+            commands.append(["wlr-randr", "--output", output["name"], "--off"])
+            continue
+        modes = [tuple(mode) for mode in output.get("modes") or []]
+        panel_mode = next((mode for mode in modes if mode in _PANEL_SIZES), None)
+        name = output.get("name") or ""
+        if panel_mode is not None or name.upper().startswith("DSI"):
+            if chosen is None or (panel_mode is not None and chosen_mode not in _PANEL_SIZES):
+                chosen = output
+                chosen_mode = panel_mode
+    if chosen is not None:
+        command = ["wlr-randr", "--output", chosen["name"], "--on", "--pos", "0,0"]
+        if chosen_mode:
+            command.extend(["--mode", "{0}x{1}".format(*chosen_mode)])
+        commands.append(command)
+    return commands
+
+
+def configure_dsi_panel():
+    """Enable the DSI face panel and switch off headless outputs before SDL starts."""
+    import subprocess
+    try:
+        proc = subprocess.run(["wlr-randr"], capture_output=True, text=True, timeout=3)
+    except Exception as exc:
+        print("[FACE] wlr-randr unavailable ({0})".format(exc))
+        return
+    text = proc.stdout or ""
+    if proc.returncode != 0 and not text:
+        print("[FACE] wlr-randr exited {0}".format(proc.returncode))
+        return
+    outputs = parse_wlr_outputs(text)
+    for output in outputs:
+        modes = ", ".join("{0}x{1}".format(*mode) for mode in output["modes"]) or "none"
+        kind = "headless" if output["headless"] else "output"
+        print("[FACE] {0} {1} modes {2}".format(kind, output["name"], modes))
+    for command in display_commands(outputs):
+        print("[FACE] {0}".format(" ".join(command)))
+        try:
+            subprocess.run(command, capture_output=True, text=True, timeout=3)
+        except Exception as exc:
+            print("[FACE] display command failed ({0})".format(exc))
+
+
 def prepare_pygame():
-    """Init pygame without taking the sound card."""
+    """Init pygame without taking the sound card.
+
+    The DSI panel is enabled first. SDL was only seeing labwc's headless
+    1920x1080 output, so the face never landed on the 800x480 screen.
+    """
+    configure_dsi_panel()
     silence_pygame_audio()
     import pygame
     pygame.init()
