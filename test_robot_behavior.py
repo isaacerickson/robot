@@ -106,6 +106,9 @@ class FacePanelTests(unittest.TestCase):
             self.assertLess(x1, 800)
             self.assertGreater(y0, 0)
             self.assertLess(y1, 480)
+            # Wider and taller than the old sockets (158x85 and 179x90).
+            self.assertGreaterEqual(box[2] - box[0], 200)
+            self.assertGreaterEqual(box[3] - box[1], 115)
         mouth = info["layers"]["talk_open"]
         mx0, my0 = face.map_art(mouth[0], mouth[1], 800, 480)
         mx1, my1 = face.map_art(mouth[2], mouth[3], 800, 480)
@@ -471,10 +474,29 @@ class PanelTests(unittest.TestCase):
         rb.remember_heard("can you hear me")
         self.assertIn("can you hear me", rb.panel_status()["heard"])
 
+    def test_heard_transcript_keeps_the_newest_hundred_words(self):
+        rb.state["heard_lines"] = []
+        rb.remember_heard("   ")
+        self.assertEqual(rb.panel_status()["heard"], [])
+        rb.remember_heard("can you hear me")
+        rb.remember_heard(" ".join("w{0}".format(i) for i in range(80)))
+        rb.remember_heard(" ".join("n{0}".format(i) for i in range(40)))
+        words = " ".join(rb.panel_status()["heard"]).split()
+        self.assertEqual(len(words), rb.HEARD_WORD_LIMIT)
+        self.assertEqual(words[0], "w20")
+        self.assertEqual(words[-40:], ["n{0}".format(i) for i in range(40)])
+        self.assertNotIn("can", words)
+        rb.state["heard_lines"] = []
+        rb.remember_heard(" ".join("z{0}".format(i) for i in range(150)))
+        words = " ".join(rb.panel_status()["heard"]).split()
+        self.assertEqual(words, ["z{0}".format(i) for i in range(50, 150)])
+
     def test_page_has_controls_and_no_secrets(self):
         page = panel.load_page()
-        for label in ("AUTOMATE", "CONTROL", "Forward", "Back", "Left", "Right", "Say", "Hear microphone"):
+        for label in ("AUTOMATE", "CONTROL", "Forward", "Back", "Left", "Right", "Say", "Hear microphone", "Heard"):
             self.assertIn(label, page)
+        self.assertIn('id="heard"', page)
+        self.assertNotIn("<ol id=\"heard\">", page)
         lowered = page.lower()
         self.assertNotIn("robot.env", lowered)
         self.assertNotIn("xai", lowered)

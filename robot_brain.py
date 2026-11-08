@@ -338,10 +338,44 @@ def say_typed(text, speaker=None):
     return cleaned
 
 
+# The phone panel shows this transcript. Keep the newest words only.
+HEARD_WORD_LIMIT = 100
+
+
+def trim_heard_words(lines, limit=HEARD_WORD_LIMIT):
+    """Drop the oldest words so the transcript stays within limit words.
+
+    Lines stay in order. The oldest line is shortened from the front when
+    only part of it still fits. Blank lines are removed.
+    """
+    chunks = []
+    for line in lines or []:
+        words = str(line).split()
+        if words:
+            chunks.append(words)
+    total = sum(len(words) for words in chunks)
+    if total > limit:
+        overflow = total - limit
+        kept = []
+        for words in chunks:
+            if overflow <= 0:
+                kept.append(words)
+            elif overflow >= len(words):
+                overflow -= len(words)
+            else:
+                kept.append(words[overflow:])
+                overflow = 0
+        chunks = kept
+    return [" ".join(words) for words in chunks]
+
+
 def remember_heard(text):
-    lines = state.setdefault("heard_lines", [])
-    lines.append(str(text))
-    del lines[:-12]
+    words = str(text).split()
+    if not words:
+        return
+    lines = list(state.get("heard_lines") or [])
+    lines.append(" ".join(words))
+    state["heard_lines"] = trim_heard_words(lines, HEARD_WORD_LIMIT)
 
 
 def panel_status():

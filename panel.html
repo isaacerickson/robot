@@ -40,8 +40,30 @@
   #say { min-width: 96px; background: #1f4f8a; }
   #hear { width: 100%; background: #3a3458; }
   #note { min-height: 1.3em; color: #c5d0e0; margin: 8px 0; }
-  #heard { margin: 0; padding-left: 18px; }
-  #heard li { margin: 4px 0; }
+  #transcript {
+    margin: 12px 0;
+    background: #1b2330;
+    border-radius: 14px;
+    padding: 12px 14px 14px;
+  }
+  #transcript h2 {
+    margin: 0 0 6px;
+    font-size: 15px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #9eb0c8;
+  }
+  #heard {
+    margin: 0;
+    min-height: 4.4em;
+    max-height: 9.5em;
+    overflow: auto;
+    font-size: 22px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #heard.empty { color: #8b98ab; }
 </style>
 </head>
 <body>
@@ -51,6 +73,10 @@
     <button type="button" id="control">CONTROL</button>
   </div>
   <img id="view" alt="Camera" width="320" height="240">
+  <section id="transcript">
+    <h2>Heard</h2>
+    <div id="heard" class="empty">Nothing heard yet.</div>
+  </section>
   <div class="pad" id="pad">
     <button type="button" class="drive wide" data-dir="forward">Forward</button>
     <button type="button" class="drive" data-dir="left">Left</button>
@@ -64,7 +90,6 @@
   </form>
   <button type="button" id="hear">Hear microphone</button>
   <p id="note">Automate: wheels stay off. Control: hold a direction to drive.</p>
-  <ol id="heard"></ol>
 <script>
 const note = document.getElementById("note");
 const view = document.getElementById("view");
@@ -159,7 +184,7 @@ function stopHear() {
 
 async function playMic() {
   if (mode !== "control") {
-    note.textContent = "Switch to Control to hear the jack mic. Automate keeps it for conversation; lines it understood are listed below.";
+    note.textContent = "Switch to Control to hear the jack mic. Automate keeps it for conversation. Heard shows the latest words the microphone understood.";
     return;
   }
   if (hearing) { stopHear(); return; }
@@ -212,13 +237,10 @@ setInterval(async () => {
       mode = data.mode;
       paint();
     }
-    const list = document.getElementById("heard");
-    list.innerHTML = "";
-    (data.heard || []).forEach((line) => {
-      const item = document.createElement("li");
-      item.textContent = line;
-      list.appendChild(item);
-    });
+    const heard = document.getElementById("heard");
+    const lines = (data.heard || []).filter((line) => String(line).trim());
+    heard.textContent = lines.length ? lines.join("\n") : "Nothing heard yet.";
+    heard.classList.toggle("empty", lines.length === 0);
   } catch (err) { /* the next poll retries */ }
 }, 1000);
 paint();
