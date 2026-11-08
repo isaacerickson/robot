@@ -160,6 +160,16 @@ class KioskTests(unittest.TestCase):
         face._face_display["last_restore"] = face.time.time()
         self.assertIsNone(face.restore_face_fullscreen("WINDOWMINIMIZED"))
 
+    def test_idle_blink_closes_without_a_face(self):
+        self.assertEqual(face.blink_envelope(0.0), 0.0)
+        self.assertEqual(face.blink_envelope(face.BLINK_SECONDS * 0.5), 1.0)
+        opening = face.blink_envelope(face.BLINK_SECONDS * 0.9)
+        self.assertGreater(opening, 0.0)
+        self.assertLess(opening, 1.0)
+        self.assertTrue(face.blink_is_finished(face.BLINK_SECONDS + 0.01))
+        self.assertTrue(face.blink_due(10.0, 9.0))
+        self.assertFalse(face.blink_due(8.0, 9.0))
+
     def test_face_code_does_not_stop_the_robot(self):
         for name in ("face.py", "face_cartoon.py"):
             with open(os.path.join(HERE, name)) as fh:
@@ -323,6 +333,45 @@ class ConversationTests(unittest.TestCase):
         self.assertFalse(rb.audio_has_speech(pcm([8000] * 200), 16000, 2))
         tone = [4000 if (i // 20) % 2 == 0 else -4000 for i in range(6400)]
         self.assertTrue(rb.audio_has_speech(pcm(tone), 16000, 2))
+        # Quiet jack speech: peak 500 clears 420, and would have failed the old 700 gate.
+        quiet = [500 if (i // 20) % 2 == 0 else -500 for i in range(6400)]
+        self.assertTrue(rb.audio_has_speech(pcm(quiet), 16000, 2))
+        too_soft = [300 if (i // 20) % 2 == 0 else -300 for i in range(6400)]
+        self.assertFalse(rb.audio_has_speech(pcm(too_soft), 16000, 2))
+
+    def test_energy_threshold_is_capped_for_the_quiet_jack(self):
+        self.assertEqual(rb.MIN_SPEECH_RMS, 165.0)
+        self.assertEqual(rb.MIN_SPEECH_PEAK, 420)
+        self.assertEqual(rb.cap_energy_threshold(800), 200.0)
+        self.assertEqual(rb.cap_energy_threshold(148), 148.0)
+        self.assertTrue(rb.ready_to_calibrate(False))
+        self.assertFalse(rb.ready_to_calibrate(True))
+
+    def test_stt_logs_are_not_throttled(self):
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rb._log_stt("[STT] one")
+            rb._log_stt("[MIC] Ignored non-speech audio")
+        text = buf.getvalue()
+        self.assertIn("[STT] one", text)
+        self.assertIn("[MIC] Ignored non-speech audio", text)
+
+    def test_usb_adapter_is_unmuted_and_mic_capture_is_on(self):
+        cmds = rb.usb_audio_commands()
+        self.assertEqual(cmds[0], ["amixer", "-c", "Device", "sset", "Speaker", "100%", "unmute"])
+        self.assertEqual(cmds[1], ["amixer", "-c", "Device", "sset", "Mic", "100%", "unmute", "cap"])
+        self.assertEqual(cmds[2], ["amixer", "-c", "Device", "sset", "Mic", "playback", "mute"])
+
+    def test_hello_does_not_wait_for_a_person(self):
+        self.assertIn("Hello", rb.STARTUP_HELLO)
+        self.assertFalse(rb.idle_hello_due(10, 9, False, False, False, []))
+        self.assertTrue(rb.idle_hello_due(300, 10, False, False, False, []))
+        self.assertFalse(rb.idle_hello_due(300, 10, False, False, False, [{"role": "user"}]))
+        self.assertFalse(rb.idle_hello_due(300, 10, True, False, False, []))
+        self.assertTrue(rb.idle_hello_due(50, 0, False, False, False, []))
+        self.assertFalse(rb.say_lost_person_line(False))
+        self.assertTrue(rb.say_lost_person_line(True))
 
 
 class TrackingTests(unittest.TestCase):
